@@ -1,0 +1,18 @@
+# Local database and SQLite runtime files
+vehicle_assignments.db
+vehicle_assignments.db-shm
+vehicle_assignments.db-wal
+*.sqlite
+*.sqlite3
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Local secrets and editor files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+Thumbs.db

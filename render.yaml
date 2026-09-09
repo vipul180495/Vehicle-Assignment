@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: vehicle-assignment
+    runtime: python
+    plan: starter
+    buildCommand: ""
+    startCommand: python server.py
+    healthCheckPath: /login
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.7
+      - key: DATABASE_PATH
+        value: /var/data/vehicle_assignments.db
+      - key: COOKIE_SECRET
+        generateValue: true
+      - key: MANAGER_PASSWORD
+        sync: false
+      - key: TEAM_PASSWORD
+        sync: false
+      - key: TEAMS_WEBHOOK_URL
+        sync: false
+    disk:
+      name: vehicle-data
+      mountPath: /var/data
+      sizeGB: 1
