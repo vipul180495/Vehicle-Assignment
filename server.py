@@ -40,7 +40,13 @@ def connect():
             from psycopg.rows import dict_row
         except ImportError as exc:
             raise RuntimeError("PostgreSQL requires: pip install -r requirements.txt") from exc
-        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        # Supabase's transaction pooler uses PgBouncer. Named prepared
+        # statements can collide when pooled server connections are reused.
+        return psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+            prepare_threshold=None,
+        )
     db = sqlite3.connect(DB_PATH, timeout=15)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
