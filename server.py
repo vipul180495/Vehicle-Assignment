@@ -126,6 +126,47 @@ def decrement_expression(column):
     return f"{fn}(0,{column}-1)"
 
 
+def assign_oldest_waiting(db, member_id):
+    """Assign the oldest same-location queue item to a teammate who just became free."""
+    member_lock = " FOR UPDATE" if USE_POSTGRES else ""
+    member = execute(
+        db,
+        "SELECT * FROM members WHERE id=? AND available_today=1 AND current_load=0" + member_lock,
+        (member_id,),
+    ).fetchone()
+    if not member:
+        return None
+    vehicle_lock = " FOR UPDATE SKIP LOCKED" if USE_POSTGRES else ""
+    vehicle = execute(
+        db,
+        "SELECT * FROM vehicles WHERE status='Queued' AND location=? ORDER BY id LIMIT 1" + vehicle_lock,
+        (member["location"],),
+    ).fetchone()
+    if not vehicle:
+        return None
+    stamp = now_iso()
+    updated = execute(
+        db,
+        "UPDATE vehicles SET status='Assigned',assigned_to=?,assignment_type='Auto',assigned_at=? "
+        "WHERE id=? AND status='Queued'",
+        (member_id, stamp, vehicle["id"]),
+    ).rowcount
+    if updated != 1:
+        return None
+    execute(
+        db,
+        "UPDATE members SET current_load=current_load+1,overall_load=overall_load+1,"
+        "auto_count=auto_count+1 WHERE id=?",
+        (member_id,),
+    )
+    execute(
+        db,
+        "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+        (vehicle["id"], "Assigned", member_id, "Auto from queue", stamp),
+    )
+    return dict(vehicle), dict(member)
+
+
 def rows(db, sql, args=()):
     return [dict(row) for row in execute(db, sql, args).fetchall()]
 
@@ -369,6 +410,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"ok": True, "assignedTo": result_member["name"], "teamsSent": sent})
 
     def complete_vehicle(self, vehicle_id):
+        next_assignment = None
         with DB_LOCK, connect() as db:
             begin_write(db)
             vehicle = execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
@@ -379,7 +421,13 @@ class Handler(SimpleHTTPRequestHandler):
             execute(db, f"UPDATE members SET current_load={decrement_expression('current_load')} WHERE id=?", (vehicle["assigned_to"],))
             execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,created_at) VALUES(?,?,?,?)",
                        (vehicle_id, "Completed", vehicle["assigned_to"], stamp))
-        self.send_json({"ok": True})
+            next_assignment = assign_oldest_waiting(db, vehicle["assigned_to"])
+        if next_assignment:
+            queued_vehicle, free_member = next_assignment
+            sent = notify_teams(queued_vehicle, free_member, "Auto")
+            return self.send_json({"ok": True, "autoAssigned": queued_vehicle["vin"],
+                                   "assignedTo": free_member["name"], "teamsSent": sent})
+        self.send_json({"ok": True, "autoAssigned": None})
 
     def reassign_vehicle(self, vehicle_id, data):
         new_member_id = int(data["memberId"])
@@ -404,9 +452,18 @@ class Handler(SimpleHTTPRequestHandler):
 
     def set_availability(self, member_id, data):
         available = 1 if data.get("available") else 0
+        next_assignment = None
         with DB_LOCK, connect() as db:
+            begin_write(db)
             execute(db, "UPDATE members SET available_today=? WHERE id=?", (available, member_id))
-        self.send_json({"ok": True})
+            if available:
+                next_assignment = assign_oldest_waiting(db, member_id)
+        if next_assignment:
+            queued_vehicle, free_member = next_assignment
+            sent = notify_teams(queued_vehicle, free_member, "Auto")
+            return self.send_json({"ok": True, "autoAssigned": queued_vehicle["vin"],
+                                   "assignedTo": free_member["name"], "teamsSent": sent})
+        self.send_json({"ok": True, "autoAssigned": None})
 
 
 if __name__ == "__main__":

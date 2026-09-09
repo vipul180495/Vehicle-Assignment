@@ -36,6 +36,7 @@ Every new assignment and reassignment posts an Adaptive Card with the VIN, teamm
 ## Business rules implemented
 
 - Auto assignment chooses an available teammate in the same location with no active vehicle and the lowest overall assignment count.
+- If nobody is available, the vehicle remains queued. The oldest same-location queued vehicle is automatically assigned when a teammate completes a vehicle or becomes available.
 - Manual assignment uses the manager's selected available teammate.
 - Assignment increments current load, overall load, and the corresponding auto/manual count in one database transaction.
 - Teammates complete or reassign their active vehicles from the Team Board.
