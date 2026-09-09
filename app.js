@@ -5,7 +5,7 @@ const initials=n=>n.split(' ').map(x=>x[0]).slice(0,2).join('');
 const fmt=d=>d?new Date(d).toLocaleString():'—';
 function toast(message,error=false){const el=$('#toast');el.textContent=message;el.style.background=error?'#9b2525':'#13283c';el.classList.add('show');setTimeout(()=>el.classList.remove('show'),3500)}
 async function api(path,options={}){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...options});const data=await r.json();if(!r.ok)throw new Error(data.error||'Request failed');return data}
-async function load(){try{Object.assign(state,await api('/api/state'));if(state.role!=='manager'&&$('#managerNav'))$('#managerNav').remove();document.body.dataset.page==='manager'?renderManager():renderTeam()}catch(e){if(e.message.includes('sign in'))location.href='/login';else throw e}}
+async function load(){try{Object.assign(state,await api('/api/state'));const expected=document.body.dataset.page;if(state.role!==expected){location.href=`/login?next=${expected}`;return}expected==='manager'?renderManager():renderTeam()}catch(e){if(e.message.includes('sign in'))location.href='/login';else throw e}}
 function pill(value){return `<span class="pill ${String(value).toLowerCase()}">${esc(value)}</span>`}
 function availableMembers(exclude){return state.members.filter(m=>m.available_today&&m.current_load===0&&m.id!==exclude)}
 function renderManager(){

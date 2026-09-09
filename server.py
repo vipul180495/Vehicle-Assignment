@@ -163,6 +163,16 @@ def notify_teams(vehicle, member, assignment_type):
 
 
 class Handler(SimpleHTTPRequestHandler):
+    def redirect_login(self, destination):
+        self.send_response(302)
+        self.send_header("Location", f"/login?next={destination}")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def serve_static(self, target):
+        self.path = target
+        return super().do_GET()
+
     def role(self):
         cookie = SimpleCookie(self.headers.get("Cookie", ""))
         value = cookie.get("vehicle_session")
@@ -214,18 +224,29 @@ class Handler(SimpleHTTPRequestHandler):
                                    "role": self.role()})
         if path == "/api/session":
             return self.send_json({"role": self.role()})
-        if path == "/login":
-            self.path = "/login.html"
-            return super().do_GET()
-        if path == "/manager":
+        if path in ("/login", "/login.html"):
+            return self.serve_static("/login.html")
+        if path in ("/styles.css", "/app.js"):
+            return self.serve_static(path)
+        if path in ("/manager", "/manager.html"):
             if self.role() != "manager":
-                self.send_response(302); self.send_header("Location", "/login?next=manager"); self.end_headers(); return
-            self.path = "/manager.html"
-        elif path in ("/team", "/"):
-            if self.role() not in ("manager", "team"):
-                self.send_response(302); self.send_header("Location", "/login?next=team"); self.end_headers(); return
-            self.path = "/team.html"
-        return super().do_GET()
+                return self.redirect_login("manager")
+            return self.serve_static("/manager.html")
+        if path in ("/team", "/team.html"):
+            if self.role() != "team":
+                return self.redirect_login("team")
+            return self.serve_static("/team.html")
+        if path == "/":
+            destination = self.role()
+            if destination not in ("manager", "team"):
+                return self.redirect_login("team")
+            self.send_response(302)
+            self.send_header("Location", f"/{destination}")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        # Never expose source code, the local database, Git metadata, or other files.
+        self.send_error(404, "Not found")
 
     def do_POST(self):
         try:
@@ -245,13 +266,13 @@ class Handler(SimpleHTTPRequestHandler):
                 if not self.require_role("manager"): return
                 return self.assign_vehicle(int(path.split("/")[3]), data)
             if path.startswith("/api/vehicles/") and path.endswith("/complete"):
-                if not self.require_role("manager", "team"): return
+                if not self.require_role("team"): return
                 return self.complete_vehicle(int(path.split("/")[3]))
             if path.startswith("/api/vehicles/") and path.endswith("/reassign"):
-                if not self.require_role("manager", "team"): return
+                if not self.require_role("team"): return
                 return self.reassign_vehicle(int(path.split("/")[3]), data)
             if path.startswith("/api/members/") and path.endswith("/availability"):
-                if not self.require_role("manager", "team"): return
+                if not self.require_role("team"): return
                 return self.set_availability(int(path.split("/")[3]), data)
             self.send_json({"error": "Not found"}, 404)
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
