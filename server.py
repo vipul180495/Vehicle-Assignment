@@ -193,6 +193,7 @@ def notify_teams(vehicle, member, assignment_type):
     url = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
     if not url:
         return False
+    notification_title = "Vehicle reassigned" if assignment_type == "Reassigned" else "Vehicle assigned"
     payload = {
         "type": "message",
         "attachments": [{
@@ -202,7 +203,7 @@ def notify_teams(vehicle, member, assignment_type):
                 "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                 "type": "AdaptiveCard", "version": "1.4",
                 "body": [
-                    {"type": "TextBlock", "text": "Vehicle assigned", "weight": "Bolder", "size": "Medium"},
+                    {"type": "TextBlock", "text": notification_title, "weight": "Bolder", "size": "Medium"},
                     {"type": "FactSet", "facts": [
                         {"title": "VIN", "value": vehicle["vin"]},
                         {"title": "Assigned to", "value": member["name"]},
