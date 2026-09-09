@@ -15,6 +15,8 @@ from http.cookies import SimpleCookie
 
 
 ROOT = Path(__file__).resolve().parent
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 DB_PATH = Path(os.getenv("DATABASE_PATH", str(ROOT / "vehicle_assignments.db")))
 DB_LOCK = threading.Lock()
 PORT = int(os.getenv("PORT", "8080"))
@@ -32,6 +34,13 @@ SEED_MEMBERS = [
 
 
 def connect():
+    if USE_POSTGRES:
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("PostgreSQL requires: pip install -r requirements.txt") from exc
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
     db = sqlite3.connect(DB_PATH, timeout=15)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
@@ -40,9 +49,10 @@ def connect():
 
 
 def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not USE_POSTGRES:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with connect() as db:
-        db.executescript("""
+        schema = """
         CREATE TABLE IF NOT EXISTS members (
           id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, location TEXT NOT NULL,
           available_today INTEGER NOT NULL DEFAULT 1,
@@ -52,7 +62,7 @@ def init_db():
           auto_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS vehicles (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, vin TEXT NOT NULL UNIQUE,
+          id {vehicle_id}, vin TEXT NOT NULL UNIQUE,
           program TEXT NOT NULL, location TEXT NOT NULL, comments TEXT DEFAULT '',
           status TEXT NOT NULL DEFAULT 'Queued', assigned_to INTEGER,
           assignment_type TEXT, assigned_at TEXT, completed_at TEXT,
@@ -61,20 +71,52 @@ def init_db():
           FOREIGN KEY(previous_assignee) REFERENCES members(id)
         );
         CREATE TABLE IF NOT EXISTS events (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, vehicle_id INTEGER NOT NULL,
+          id {event_id}, vehicle_id INTEGER NOT NULL,
           event_type TEXT NOT NULL, member_id INTEGER, details TEXT,
           created_at TEXT NOT NULL,
           FOREIGN KEY(vehicle_id) REFERENCES vehicles(id),
           FOREIGN KEY(member_id) REFERENCES members(id)
         );
-        """)
-        db.executemany(
-            "INSERT OR IGNORE INTO members(id,name,location) VALUES(?,?,?)", SEED_MEMBERS
+        """.format(
+            vehicle_id="SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT",
+            event_id="SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT",
         )
+        if USE_POSTGRES:
+            for statement in schema.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            db.executemany(
+                "INSERT INTO members(id,name,location) VALUES(%s,%s,%s) ON CONFLICT (id) DO NOTHING",
+                SEED_MEMBERS,
+            )
+        else:
+            db.executescript(schema)
+            db.executemany(
+                "INSERT OR IGNORE INTO members(id,name,location) VALUES(?,?,?)", SEED_MEMBERS
+            )
+
+
+def sql(query):
+    """Translate SQLite placeholders for PostgreSQL while keeping queries readable."""
+    return query.replace("?", "%s") if USE_POSTGRES else query
+
+
+def execute(db, query, args=()):
+    return db.execute(sql(query), args)
+
+
+def begin_write(db):
+    if not USE_POSTGRES:
+        db.execute("BEGIN IMMEDIATE")
+
+
+def decrement_expression(column):
+    fn = "GREATEST" if USE_POSTGRES else "MAX"
+    return f"{fn}(0,{column}-1)"
 
 
 def rows(db, sql, args=()):
-    return [dict(row) for row in db.execute(sql, args).fetchall()]
+    return [dict(row) for row in execute(db, sql, args).fetchall()]
 
 
 def now_iso():
@@ -242,11 +284,13 @@ class Handler(SimpleHTTPRequestHandler):
         if not vin or not program or not location:
             return self.send_json({"error": "VIN, program and location are required."}, 400)
         with DB_LOCK, connect() as db:
-            cursor = db.execute(
-                "INSERT INTO vehicles(vin,program,location,comments) VALUES(?,?,?,?)",
+            insert = "INSERT INTO vehicles(vin,program,location,comments) VALUES(?,?,?,?)"
+            if USE_POSTGRES:
+                insert += " RETURNING id"
+            cursor = execute(db, insert,
                 (vin, program, location, str(data.get("comments", "")).strip())
             )
-            vehicle_id = cursor.lastrowid
+            vehicle_id = cursor.fetchone()["id"] if USE_POSTGRES else cursor.lastrowid
         if data.get("assignMode") in ("Auto", "Manual"):
             return self.assign_vehicle(vehicle_id, data)
         self.send_json({"ok": True, "id": vehicle_id}, 201)
@@ -254,32 +298,34 @@ class Handler(SimpleHTTPRequestHandler):
     def assign_vehicle(self, vehicle_id, data):
         mode = data.get("assignMode", "Auto")
         with DB_LOCK, connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            begin_write(db)
+            vehicle = execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
             if not vehicle or vehicle["status"] != "Queued":
                 return self.send_json({"error": "Vehicle is not available to assign."}, 409)
             if mode == "Manual":
-                member = db.execute(
-                    "SELECT * FROM members WHERE id=? AND available_today=1 AND current_load=0",
+                lock = " FOR UPDATE" if USE_POSTGRES else ""
+                member = execute(db,
+                    "SELECT * FROM members WHERE id=? AND available_today=1 AND current_load=0" + lock,
                     (int(data["memberId"]),)
                 ).fetchone()
             else:
-                member = db.execute("""
+                lock = " FOR UPDATE SKIP LOCKED" if USE_POSTGRES else ""
+                member = execute(db, """
                   SELECT * FROM members WHERE available_today=1 AND current_load=0
                   AND location=? ORDER BY overall_load, auto_count, id LIMIT 1
-                """, (vehicle["location"],)).fetchone()
+                """ + lock, (vehicle["location"],)).fetchone()
             if not member:
                 return self.send_json({"error": "No available teammate for this location."}, 409)
             stamp = now_iso()
-            updated = db.execute(
+            updated = execute(db,
                 "UPDATE vehicles SET status='Assigned',assigned_to=?,assignment_type=?,assigned_at=? WHERE id=? AND status='Queued'",
                 (member["id"], mode, stamp, vehicle_id)
             ).rowcount
             if updated != 1:
                 return self.send_json({"error": "Vehicle was assigned by someone else. Refresh and try again."}, 409)
             count_field = "manual_count" if mode == "Manual" else "auto_count"
-            db.execute(f"UPDATE members SET current_load=current_load+1,overall_load=overall_load+1,{count_field}={count_field}+1 WHERE id=?", (member["id"],))
-            db.execute("INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+            execute(db, f"UPDATE members SET current_load=current_load+1,overall_load=overall_load+1,{count_field}={count_field}+1 WHERE id=?", (member["id"],))
+            execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
                        (vehicle_id, "Assigned", member["id"], mode, stamp))
             result_vehicle, result_member = dict(vehicle), dict(member)
         sent = notify_teams(result_vehicle, result_member, mode)
@@ -287,14 +333,14 @@ class Handler(SimpleHTTPRequestHandler):
 
     def complete_vehicle(self, vehicle_id):
         with DB_LOCK, connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            begin_write(db)
+            vehicle = execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
             if not vehicle or vehicle["status"] != "Assigned":
                 return self.send_json({"error": "Vehicle is not currently assigned."}, 409)
             stamp = now_iso()
-            db.execute("UPDATE vehicles SET status='Completed',completed_at=? WHERE id=?", (stamp, vehicle_id))
-            db.execute("UPDATE members SET current_load=MAX(0,current_load-1) WHERE id=?", (vehicle["assigned_to"],))
-            db.execute("INSERT INTO events(vehicle_id,event_type,member_id,created_at) VALUES(?,?,?,?)",
+            execute(db, "UPDATE vehicles SET status='Completed',completed_at=? WHERE id=?", (stamp, vehicle_id))
+            execute(db, f"UPDATE members SET current_load={decrement_expression('current_load')} WHERE id=?", (vehicle["assigned_to"],))
+            execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,created_at) VALUES(?,?,?,?)",
                        (vehicle_id, "Completed", vehicle["assigned_to"], stamp))
         self.send_json({"ok": True})
 
@@ -302,17 +348,18 @@ class Handler(SimpleHTTPRequestHandler):
         new_member_id = int(data["memberId"])
         reason = str(data.get("reason", "")).strip()
         with DB_LOCK, connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            vehicle = db.execute("SELECT * FROM vehicles WHERE id=? AND status='Assigned'", (vehicle_id,)).fetchone()
-            member = db.execute("SELECT * FROM members WHERE id=? AND available_today=1 AND current_load=0", (new_member_id,)).fetchone()
+            begin_write(db)
+            vehicle = execute(db, "SELECT * FROM vehicles WHERE id=? AND status='Assigned'", (vehicle_id,)).fetchone()
+            lock = " FOR UPDATE" if USE_POSTGRES else ""
+            member = execute(db, "SELECT * FROM members WHERE id=? AND available_today=1 AND current_load=0" + lock, (new_member_id,)).fetchone()
             if not vehicle or not member:
                 return self.send_json({"error": "Vehicle or selected teammate is no longer available."}, 409)
             old_id, stamp = vehicle["assigned_to"], now_iso()
-            db.execute("UPDATE vehicles SET previous_assignee=?,assigned_to=?,assignment_type='Manual',assigned_at=?,reassignment_reason=? WHERE id=?",
+            execute(db, "UPDATE vehicles SET previous_assignee=?,assigned_to=?,assignment_type='Manual',assigned_at=?,reassignment_reason=? WHERE id=?",
                        (old_id, new_member_id, stamp, reason, vehicle_id))
-            db.execute("UPDATE members SET current_load=MAX(0,current_load-1) WHERE id=?", (old_id,))
-            db.execute("UPDATE members SET current_load=current_load+1,overall_load=overall_load+1,manual_count=manual_count+1 WHERE id=?", (new_member_id,))
-            db.execute("INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+            execute(db, f"UPDATE members SET current_load={decrement_expression('current_load')} WHERE id=?", (old_id,))
+            execute(db, "UPDATE members SET current_load=current_load+1,overall_load=overall_load+1,manual_count=manual_count+1 WHERE id=?", (new_member_id,))
+            execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
                        (vehicle_id, "Reassigned", new_member_id, reason, stamp))
             result_vehicle, result_member = dict(vehicle), dict(member)
         sent = notify_teams(result_vehicle, result_member, "Reassigned")
@@ -321,7 +368,7 @@ class Handler(SimpleHTTPRequestHandler):
     def set_availability(self, member_id, data):
         available = 1 if data.get("available") else 0
         with DB_LOCK, connect() as db:
-            db.execute("UPDATE members SET available_today=? WHERE id=?", (available, member_id))
+            execute(db, "UPDATE members SET available_today=? WHERE id=?", (available, member_id))
         self.send_json({"ok": True})
 
 

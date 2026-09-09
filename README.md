@@ -49,9 +49,9 @@ For a pilot, run this on an always-on internal Windows PC/server and allow inbou
 
 ## Deploy to Render
 
-The included `render.yaml` creates a free Render web service. Push this folder to a private GitHub repository, choose **New > Blueprint** in Render, connect the repository, and supply `MANAGER_PASSWORD`, `TEAM_PASSWORD`, and optionally `TEAMS_WEBHOOK_URL` when prompted. Render generates `COOKIE_SECRET` automatically.
+The included `render.yaml` creates a free Render web service. Push this folder to a private GitHub repository, choose **New > Blueprint** in Render, connect the repository, and supply `DATABASE_URL`, `MANAGER_PASSWORD`, `TEAM_PASSWORD`, and optionally `TEAMS_WEBHOOK_URL` when prompted. Render generates `COOKIE_SECRET` automatically.
 
-Important: this free deployment is for demonstrations only while it uses SQLite. Render's free filesystem is ephemeral, so assignment data is lost on restart, spin-down, or redeployment. Connect a persistent external database before using real operational data.
+For persistent storage on a free deployment, create a free Supabase project, copy its PostgreSQL connection string, and set it as Render's `DATABASE_URL`. Use the Supabase transaction pooler connection string when direct database connections are not available. The application uses local SQLite only when `DATABASE_URL` is absent.
 
 ## Backup
 
