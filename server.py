@@ -76,7 +76,7 @@ def init_db():
           auto_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS vehicles (
-          id {vehicle_id}, vin TEXT NOT NULL UNIQUE,
+          id {vehicle_id}, vin TEXT NOT NULL,
           program TEXT NOT NULL, location TEXT NOT NULL, comments TEXT DEFAULT '',
           status TEXT NOT NULL DEFAULT 'Queued', assigned_to INTEGER,
           assignment_type TEXT, assigned_at TEXT, completed_at TEXT,
@@ -106,6 +106,9 @@ def init_db():
             for statement in schema.split(";"):
                 if statement.strip():
                     db.execute(statement)
+            # Earlier versions treated VIN as unique. A vehicle can return for
+            # another work assignment, so remove that legacy restriction.
+            db.execute("ALTER TABLE vehicles DROP CONSTRAINT IF EXISTS vehicles_vin_key")
             for member in SEED_MEMBERS:
                 db.execute(
                     "INSERT INTO members(id,name,location) VALUES(%s,%s,%s) ON CONFLICT (id) DO NOTHING",
@@ -205,7 +208,6 @@ def notify_teams(vehicle, member, assignment_type):
                         {"title": "Assigned to", "value": member["name"]},
                         {"title": "Program", "value": vehicle["program"]},
                         {"title": "Location", "value": vehicle["location"]},
-                        {"title": "Assignment", "value": assignment_type},
                         {"title": "Comments", "value": vehicle.get("comments") or "—"}
                     ]}
                 ]
@@ -361,7 +363,7 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             self.send_json({"error": f"Invalid request: {exc}"}, 400)
         except sqlite3.IntegrityError as exc:
-            self.send_json({"error": "VIN already exists or the data is invalid."}, 409)
+            self.send_json({"error": "The submitted data conflicts with an existing record."}, 409)
         except Exception as exc:
             print(exc)
             self.send_json({"error": "The operation could not be completed."}, 500)

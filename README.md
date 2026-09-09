@@ -43,7 +43,7 @@ Every new assignment and reassignment posts an Adaptive Card with the VIN, teamm
 - Teammates complete or reassign their active vehicles from the Team Board.
 - Completion decrements current load but preserves historical totals.
 - Reassignment frees the old teammate and increments the new teammate's manual and overall totals.
-- The database rejects duplicate VINs, and concurrent requests cannot assign the same vehicle twice.
+- The same VIN can be submitted again for a later work assignment; each submission is stored as a separate record. Concurrent requests cannot assign the same work item twice.
 
 ## Sharing with the team
 
