@@ -23,6 +23,10 @@ PORT = int(os.getenv("PORT", "8080"))
 COOKIE_SECRET = os.getenv("COOKIE_SECRET", "").strip() or secrets.token_hex(32)
 MANAGER_PASSWORD = os.getenv("MANAGER_PASSWORD", "").strip()
 TEAM_PASSWORD = os.getenv("TEAM_PASSWORD", "").strip()
+PROGRAMS = {
+    "DT REEV SFFB", "WS REEV SFFB", "DT REEV", "WS REEV",
+    "DT ICE", "DT TRX", "DT F16", "HDCC",
+}
 
 SEED_MEMBERS = [
     (1, "Dheeraj Adabala", "FREC"), (2, "Elias Saleh", "FREC"),
@@ -314,6 +318,8 @@ class Handler(SimpleHTTPRequestHandler):
         location = str(data["location"]).strip()
         if not vin or not program or not location:
             return self.send_json({"error": "VIN, program and location are required."}, 400)
+        if program not in PROGRAMS:
+            return self.send_json({"error": "Select a valid vehicle program."}, 400)
         with DB_LOCK, connect() as db:
             insert = "INSERT INTO vehicles(vin,program,location,comments) VALUES(?,?,?,?)"
             if USE_POSTGRES:
