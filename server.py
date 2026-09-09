@@ -232,7 +232,10 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"role": self.role()})
         if path in ("/login", "/login.html"):
             return self.serve_static("/login.html")
-        if path in ("/styles.css", "/app.js"):
+        if path in (
+            "/styles.css", "/app.js",
+            "/assets/vona-logo.png", "/assets/rob-caudill-logo.png",
+        ):
             return self.serve_static(path)
         if path in ("/manager", "/manager.html"):
             if self.role() != "manager":
