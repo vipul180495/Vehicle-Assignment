@@ -4,13 +4,16 @@ import sqlite3
 import threading
 import urllib.request
 import base64
+import csv
 import hashlib
 import hmac
+import io
+import re
 import secrets
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from http.cookies import SimpleCookie
 
 
@@ -23,6 +26,7 @@ PORT = int(os.getenv("PORT", "8080"))
 COOKIE_SECRET = os.getenv("COOKIE_SECRET", "").strip() or secrets.token_hex(32)
 MANAGER_PASSWORD = os.getenv("MANAGER_PASSWORD", "").strip()
 TEAM_PASSWORD = os.getenv("TEAM_PASSWORD", "").strip()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 PROGRAMS = {
     "DT REEV SFFB", "WS REEV SFFB", "DT REEV", "WS REEV",
     "DT ICE", "DT TRX", "DT F16", "HDCC",
@@ -85,6 +89,13 @@ def init_db():
           event_type TEXT NOT NULL, member_id INTEGER, details TEXT,
           created_at TEXT NOT NULL,
           FOREIGN KEY(vehicle_id) REFERENCES vehicles(id),
+          FOREIGN KEY(member_id) REFERENCES members(id)
+        );
+        CREATE TABLE IF NOT EXISTS monthly_archives (
+          period TEXT NOT NULL, member_id INTEGER NOT NULL,
+          overall_load INTEGER NOT NULL, manual_count INTEGER NOT NULL,
+          auto_count INTEGER NOT NULL, exported_at TEXT NOT NULL,
+          PRIMARY KEY(period, member_id),
           FOREIGN KEY(member_id) REFERENCES members(id)
         );
         """.format(
@@ -231,7 +242,7 @@ class Handler(SimpleHTTPRequestHandler):
             return None
         role, signature = value.value.split(".", 1)
         expected = hmac.new(COOKIE_SECRET.encode(), role.encode(), hashlib.sha256).hexdigest()
-        return role if role in ("manager", "team") and hmac.compare_digest(signature, expected) else None
+        return role if role in ("manager", "team", "admin") and hmac.compare_digest(signature, expected) else None
 
     def require_role(self, *allowed):
         if self.role() not in allowed:
@@ -258,8 +269,12 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/api/admin/export":
+            if not self.require_role("admin"):
+                return
+            return self.export_month_csv()
         if path == "/api/state":
-            if not self.require_role("manager", "team"):
+            if not self.require_role("manager", "team", "admin"):
                 return
             with connect() as db:
                 members = rows(db, "SELECT * FROM members ORDER BY name")
@@ -280,6 +295,7 @@ class Handler(SimpleHTTPRequestHandler):
         if path in (
             "/styles.css", "/app.js",
             "/assets/vona-logo.png", "/assets/rob-caudill-logo.png",
+            "/assets/dashboard-background.png",
         ):
             return self.serve_static(path)
         if path in ("/manager", "/manager.html"):
@@ -290,9 +306,13 @@ class Handler(SimpleHTTPRequestHandler):
             if self.role() != "team":
                 return self.redirect_login("team")
             return self.serve_static("/team.html")
+        if path in ("/admin", "/admin.html"):
+            if self.role() != "admin":
+                return self.redirect_login("admin")
+            return self.serve_static("/admin.html")
         if path == "/":
             destination = self.role()
-            if destination not in ("manager", "team"):
+            if destination not in ("manager", "team", "admin"):
                 return self.redirect_login("team")
             self.send_response(302)
             self.send_header("Location", f"/{destination}")
@@ -313,6 +333,9 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header("Set-Cookie", "vehicle_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
                 self.send_header("Content-Type", "application/json")
                 self.end_headers(); self.wfile.write(b'{"ok":true}'); return
+            if path == "/api/admin/reset-counts":
+                if not self.require_role("admin"): return
+                return self.reset_monthly_counts(data)
             if path == "/api/vehicles":
                 if not self.require_role("manager"): return
                 return self.create_vehicle(data)
@@ -340,7 +363,11 @@ class Handler(SimpleHTTPRequestHandler):
     def login(self, data):
         requested = str(data.get("role", "team"))
         supplied = str(data.get("password", ""))
-        configured = MANAGER_PASSWORD if requested == "manager" else TEAM_PASSWORD
+        configured = {
+            "manager": MANAGER_PASSWORD,
+            "team": TEAM_PASSWORD,
+            "admin": ADMIN_PASSWORD,
+        }.get(requested, "")
         if not configured:
             return self.send_json({"error": f"The {requested} password has not been configured."}, 503)
         if not hmac.compare_digest(supplied, configured):
@@ -352,6 +379,62 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Set-Cookie", self.session_cookie(requested))
         self.end_headers()
         self.wfile.write(body)
+
+    def requested_month(self, data=None):
+        if data is None:
+            query = parse_qs(urlparse(self.path).query)
+            value = query.get("month", [""])[0]
+        else:
+            value = str(data.get("month", ""))
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
+            raise ValueError("Month must use YYYY-MM format.")
+        return value
+
+    def export_month_csv(self):
+        month = self.requested_month()
+        with connect() as db:
+            report_rows = rows(db, """
+              SELECT e.created_at, e.event_type, v.vin, v.program, v.location,
+                     m.name teammate, COALESCE(v.assignment_type,'') assignment_type,
+                     COALESCE(e.details,'') details
+              FROM events e JOIN vehicles v ON v.id=e.vehicle_id
+              LEFT JOIN members m ON m.id=e.member_id
+              WHERE e.created_at LIKE ? AND e.event_type IN ('Assigned','Reassigned','Completed')
+              ORDER BY e.created_at, e.id
+            """, (month + "%",))
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow(["Date (UTC)", "Event", "VIN", "Program", "Location",
+                         "Teammate", "Assignment Type", "Details"])
+        for row in report_rows:
+            writer.writerow([row["created_at"], row["event_type"], row["vin"],
+                             row["program"], row["location"], row["teammate"] or "",
+                             row["assignment_type"], row["details"]])
+        body = output.getvalue().encode("utf-8-sig")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="vehicle-assignments-{month}.csv"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def reset_monthly_counts(self, data):
+        month = self.requested_month(data)
+        stamp = now_iso()
+        with DB_LOCK, connect() as db:
+            begin_write(db)
+            existing = execute(db, "SELECT 1 FROM monthly_archives WHERE period=? LIMIT 1", (month,)).fetchone()
+            if existing:
+                return self.send_json({"error": f"Counts for {month} were already archived and reset."}, 409)
+            members = rows(db, "SELECT id,overall_load,manual_count,auto_count FROM members")
+            for member in members:
+                execute(db, """
+                  INSERT INTO monthly_archives(period,member_id,overall_load,manual_count,auto_count,exported_at)
+                  VALUES(?,?,?,?,?,?)
+                """, (month, member["id"], member["overall_load"], member["manual_count"],
+                      member["auto_count"], stamp))
+            execute(db, "UPDATE members SET overall_load=0,manual_count=0,auto_count=0")
+        self.send_json({"ok": True, "membersArchived": len(members), "period": month})
 
     def create_vehicle(self, data):
         vin = str(data["vin"]).strip().upper()
@@ -473,6 +556,6 @@ if __name__ == "__main__":
     print(f"Vehicle Assignment app: http://localhost:{PORT}")
     print(f"Manager view: http://localhost:{PORT}/manager")
     print(f"Team view:    http://localhost:{PORT}/team")
-    if not MANAGER_PASSWORD or not TEAM_PASSWORD:
-        print("WARNING: Set MANAGER_PASSWORD and TEAM_PASSWORD before sharing the app.")
+    if not MANAGER_PASSWORD or not TEAM_PASSWORD or not ADMIN_PASSWORD:
+        print("WARNING: Set MANAGER_PASSWORD, TEAM_PASSWORD, and ADMIN_PASSWORD before sharing the app.")
     server.serve_forever()
