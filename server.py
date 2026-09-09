@@ -85,10 +85,11 @@ def init_db():
             for statement in schema.split(";"):
                 if statement.strip():
                     db.execute(statement)
-            db.executemany(
-                "INSERT INTO members(id,name,location) VALUES(%s,%s,%s) ON CONFLICT (id) DO NOTHING",
-                SEED_MEMBERS,
-            )
+            for member in SEED_MEMBERS:
+                db.execute(
+                    "INSERT INTO members(id,name,location) VALUES(%s,%s,%s) ON CONFLICT (id) DO NOTHING",
+                    member,
+                )
         else:
             db.executescript(schema)
             db.executemany(
