@@ -53,7 +53,7 @@ For a pilot, run this on an always-on internal Windows PC/server and allow inbou
 
 The included `render.yaml` creates a free Render web service. Push this folder to a private GitHub repository, choose **New > Blueprint** in Render, connect the repository, and supply `DATABASE_URL`, `MANAGER_PASSWORD`, `TEAM_PASSWORD`, `ADMIN_PASSWORD`, and optionally `TEAMS_WEBHOOK_URL` when prompted. Render generates `COOKIE_SECRET` automatically.
 
-The Admin page at `/admin` can export a selected month's event history as CSV and archive/reset monthly Overall, Auto, and Manual counters. Current Load and active vehicle assignments are never reset.
+The Admin page at `/admin` can export a selected month's event history as CSV, correct each teammate's Auto/Manual counts, recalculate Current Load from active vehicles, and archive/reset monthly Overall, Auto, and Manual counters. Current Load is never edited arbitrarily because it controls assignment availability.
 
 For persistent storage on a free deployment, create a free Supabase project, copy its PostgreSQL connection string, and set it as Render's `DATABASE_URL`. Use the Supabase transaction pooler connection string when direct database connections are not available. The application uses local SQLite only when `DATABASE_URL` is absent.
 

@@ -336,6 +336,12 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/admin/reset-counts":
                 if not self.require_role("admin"): return
                 return self.reset_monthly_counts(data)
+            if path == "/api/admin/recalculate-loads":
+                if not self.require_role("admin"): return
+                return self.recalculate_current_loads()
+            if path.startswith("/api/admin/members/") and path.endswith("/counts"):
+                if not self.require_role("admin"): return
+                return self.correct_member_counts(int(path.split("/")[4]), data)
             if path == "/api/vehicles":
                 if not self.require_role("manager"): return
                 return self.create_vehicle(data)
@@ -435,6 +441,32 @@ class Handler(SimpleHTTPRequestHandler):
                       member["auto_count"], stamp))
             execute(db, "UPDATE members SET overall_load=0,manual_count=0,auto_count=0")
         self.send_json({"ok": True, "membersArchived": len(members), "period": month})
+
+    def correct_member_counts(self, member_id, data):
+        auto_count = int(data.get("autoCount", 0))
+        manual_count = int(data.get("manualCount", 0))
+        if auto_count < 0 or manual_count < 0:
+            return self.send_json({"error": "Counts cannot be negative."}, 400)
+        with DB_LOCK, connect() as db:
+            updated = execute(
+                db,
+                "UPDATE members SET auto_count=?,manual_count=?,overall_load=? WHERE id=?",
+                (auto_count, manual_count, auto_count + manual_count, member_id),
+            ).rowcount
+            if updated != 1:
+                return self.send_json({"error": "Teammate not found."}, 404)
+        self.send_json({"ok": True, "overallLoad": auto_count + manual_count})
+
+    def recalculate_current_loads(self):
+        with DB_LOCK, connect() as db:
+            begin_write(db)
+            execute(db, """
+              UPDATE members SET current_load=(
+                SELECT COUNT(*) FROM vehicles
+                WHERE vehicles.assigned_to=members.id AND vehicles.status='Assigned'
+              )
+            """)
+        self.send_json({"ok": True})
 
     def create_vehicle(self, data):
         vin = str(data["vin"]).strip().upper()
