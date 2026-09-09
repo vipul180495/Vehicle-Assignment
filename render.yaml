@@ -3,7 +3,6 @@ services:
     name: vehicle-assignment
     runtime: python
     plan: starter
-    buildCommand: ""
     startCommand: python server.py
     healthCheckPath: /login
     envVars:
