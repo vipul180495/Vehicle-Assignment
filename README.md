@@ -49,9 +49,9 @@ For a pilot, run this on an always-on internal Windows PC/server and allow inbou
 
 ## Deploy to Render
 
-The included `render.yaml` creates a paid Starter web service with a 1 GB persistent disk. Push this folder to a private GitHub repository, choose **New > Blueprint** in Render, connect the repository, and supply `MANAGER_PASSWORD`, `TEAM_PASSWORD`, and optionally `TEAMS_WEBHOOK_URL` when prompted. Render generates `COOKIE_SECRET` automatically.
+The included `render.yaml` creates a free Render web service. Push this folder to a private GitHub repository, choose **New > Blueprint** in Render, connect the repository, and supply `MANAGER_PASSWORD`, `TEAM_PASSWORD`, and optionally `TEAMS_WEBHOOK_URL` when prompted. Render generates `COOKIE_SECRET` automatically.
 
-Do not change the service to Render's Free plan while using SQLite: free web services have an ephemeral filesystem and assignment data will be lost on restart or redeploy.
+Important: this free deployment is for demonstrations only while it uses SQLite. Render's free filesystem is ephemeral, so assignment data is lost on restart, spin-down, or redeployment. Connect a persistent external database before using real operational data.
 
 ## Backup
 
