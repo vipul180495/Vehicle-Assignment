@@ -382,6 +382,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/admin/members/") and path.endswith("/counts"):
                 if not self.require_role("admin"): return
                 return self.correct_member_counts(int(path.split("/")[4]), data)
+            if path.startswith("/api/admin/vehicles/") and path.endswith("/notify"):
+                if not self.require_role("admin"): return
+                return self.resend_assignment_notification(int(path.split("/")[4]))
             if path == "/api/vehicles":
                 if not self.require_role("manager"): return
                 return self.create_vehicle(data)
@@ -507,6 +510,22 @@ class Handler(SimpleHTTPRequestHandler):
               )
             """)
         self.send_json({"ok": True})
+
+    def resend_assignment_notification(self, vehicle_id):
+        with connect() as db:
+            vehicle = execute(db, """
+              SELECT v.*, m.name assigned_name
+              FROM vehicles v JOIN members m ON m.id=v.assigned_to
+              WHERE v.id=? AND v.status='Assigned'
+            """, (vehicle_id,)).fetchone()
+        if not vehicle:
+            return self.send_json({"error": "Only an active assigned vehicle can be notified."}, 409)
+        vehicle_data = dict(vehicle)
+        sent = safe_notify_teams(vehicle_data, {"name": vehicle_data["assigned_name"]}, "Auto")
+        if not sent:
+            return self.send_json({"error": "Teams did not accept the notification. Check the webhook and Render logs."}, 502)
+        self.send_json({"ok": True, "vin": vehicle_data["vin"],
+                        "assignedTo": vehicle_data["assigned_name"]})
 
     def create_vehicle(self, data):
         vin = str(data["vin"]).strip().upper()
