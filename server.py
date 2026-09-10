@@ -197,6 +197,7 @@ def notify_teams(vehicle, member, assignment_type):
     url = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
     if not url:
         return False
+    notification_title = "Vehicle assigned"
     reassigned = assignment_type == "Reassigned"
     completed = assignment_type == "Completed"
     if completed:
@@ -251,6 +252,15 @@ def notify_teams(vehicle, member, assignment_type):
             return 200 <= response.status < 300
     except Exception as exc:
         print(f"Teams notification failed: {exc}")
+        return False
+
+
+def safe_notify_teams(vehicle, member, assignment_type):
+    """A notification failure must never fail or roll back vehicle work."""
+    try:
+        return notify_teams(vehicle, member, assignment_type)
+    except Exception as exc:
+        print(f"Teams notification template failed: {exc}")
         return False
 
 
@@ -551,7 +561,7 @@ class Handler(SimpleHTTPRequestHandler):
             execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
                        (vehicle_id, "Assigned", member["id"], mode, stamp))
             result_vehicle, result_member = dict(vehicle), dict(member)
-        sent = notify_teams(result_vehicle, result_member, mode)
+        sent = safe_notify_teams(result_vehicle, result_member, mode)
         self.send_json({"ok": True, "assignedTo": result_member["name"], "teamsSent": sent})
 
     def complete_vehicle(self, vehicle_id):
@@ -572,10 +582,10 @@ class Handler(SimpleHTTPRequestHandler):
             next_assignment = assign_oldest_waiting(db, vehicle["assigned_to"])
             completed_vehicle = dict(vehicle)
             completed_member = dict(member) if member else {"name": "Unknown"}
-        completed_sent = notify_teams(completed_vehicle, completed_member, "Completed")
+        completed_sent = safe_notify_teams(completed_vehicle, completed_member, "Completed")
         if next_assignment:
             queued_vehicle, free_member = next_assignment
-            queue_sent = notify_teams(queued_vehicle, free_member, "Auto")
+            queue_sent = safe_notify_teams(queued_vehicle, free_member, "Auto")
             return self.send_json({"ok": True, "autoAssigned": queued_vehicle["vin"],
                                    "assignedTo": free_member["name"], "teamsSent": completed_sent,
                                    "queueTeamsSent": queue_sent})
@@ -603,7 +613,7 @@ class Handler(SimpleHTTPRequestHandler):
             result_vehicle, result_member = dict(vehicle), dict(member)
             result_vehicle["previous_name"] = previous_member["name"] if previous_member else ""
             result_vehicle["reassignment_reason"] = reason
-        sent = notify_teams(result_vehicle, result_member, "Reassigned")
+        sent = safe_notify_teams(result_vehicle, result_member, "Reassigned")
         self.send_json({"ok": True, "assignedTo": result_member["name"], "teamsSent": sent})
 
     def set_availability(self, member_id, data):
@@ -616,7 +626,7 @@ class Handler(SimpleHTTPRequestHandler):
                 next_assignment = assign_oldest_waiting(db, member_id)
         if next_assignment:
             queued_vehicle, free_member = next_assignment
-            sent = notify_teams(queued_vehicle, free_member, "Auto")
+            sent = safe_notify_teams(queued_vehicle, free_member, "Auto")
             return self.send_json({"ok": True, "autoAssigned": queued_vehicle["vin"],
                                    "assignedTo": free_member["name"], "teamsSent": sent})
         self.send_json({"ok": True, "autoAssigned": None})
