@@ -198,8 +198,18 @@ def notify_teams(vehicle, member, assignment_type):
     if not url:
         return False
     reassigned = assignment_type == "Reassigned"
-    notification_title = "🔁 Vehicle Reassigned" if reassigned else "Vehicle assigned"
-    if reassigned:
+    completed = assignment_type == "Completed"
+    if completed:
+        notification_title = "✅ Vehicle Completed"
+        facts = [
+            {"title": "VIN", "value": vehicle["vin"]},
+            {"title": "Engineer", "value": member["name"]},
+            {"title": "Program", "value": vehicle["program"]},
+            {"title": "Location", "value": vehicle["location"]},
+            {"title": "Comments", "value": vehicle.get("comments") or "—"},
+        ]
+    elif reassigned:
+        notification_title = "🔁 Vehicle Reassigned"
         facts = [
             {"title": "VIN", "value": vehicle["vin"]},
             {"title": "New Engineer", "value": member["name"]},
@@ -546,23 +556,30 @@ class Handler(SimpleHTTPRequestHandler):
 
     def complete_vehicle(self, vehicle_id):
         next_assignment = None
+        completed_vehicle = None
+        completed_member = None
         with DB_LOCK, connect() as db:
             begin_write(db)
             vehicle = execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
             if not vehicle or vehicle["status"] != "Assigned":
                 return self.send_json({"error": "Vehicle is not currently assigned."}, 409)
+            member = execute(db, "SELECT * FROM members WHERE id=?", (vehicle["assigned_to"],)).fetchone()
             stamp = now_iso()
             execute(db, "UPDATE vehicles SET status='Completed',completed_at=? WHERE id=?", (stamp, vehicle_id))
             recalculate_member_load(db, vehicle["assigned_to"])
             execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,created_at) VALUES(?,?,?,?)",
                        (vehicle_id, "Completed", vehicle["assigned_to"], stamp))
             next_assignment = assign_oldest_waiting(db, vehicle["assigned_to"])
+            completed_vehicle = dict(vehicle)
+            completed_member = dict(member) if member else {"name": "Unknown"}
+        completed_sent = notify_teams(completed_vehicle, completed_member, "Completed")
         if next_assignment:
             queued_vehicle, free_member = next_assignment
-            sent = notify_teams(queued_vehicle, free_member, "Auto")
+            queue_sent = notify_teams(queued_vehicle, free_member, "Auto")
             return self.send_json({"ok": True, "autoAssigned": queued_vehicle["vin"],
-                                   "assignedTo": free_member["name"], "teamsSent": sent})
-        self.send_json({"ok": True, "autoAssigned": None})
+                                   "assignedTo": free_member["name"], "teamsSent": completed_sent,
+                                   "queueTeamsSent": queue_sent})
+        self.send_json({"ok": True, "autoAssigned": None, "teamsSent": completed_sent})
 
     def reassign_vehicle(self, vehicle_id, data):
         new_member_id = int(data["memberId"])
