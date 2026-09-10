@@ -197,7 +197,26 @@ def notify_teams(vehicle, member, assignment_type):
     url = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
     if not url:
         return False
-    notification_title = "Vehicle reassigned" if assignment_type == "Reassigned" else "Vehicle assigned"
+    reassigned = assignment_type == "Reassigned"
+    notification_title = "🔁 Vehicle Reassigned" if reassigned else "Vehicle assigned"
+    if reassigned:
+        facts = [
+            {"title": "VIN", "value": vehicle["vin"]},
+            {"title": "New Engineer", "value": member["name"]},
+            {"title": "Previous Engineer", "value": vehicle.get("previous_name") or "—"},
+            {"title": "Program", "value": vehicle["program"]},
+            {"title": "Reason", "value": vehicle.get("reassignment_reason") or "—"},
+            {"title": "Location", "value": vehicle["location"]},
+            {"title": "Comments", "value": vehicle.get("comments") or "—"},
+        ]
+    else:
+        facts = [
+            {"title": "VIN", "value": vehicle["vin"]},
+            {"title": "Assigned to", "value": member["name"]},
+            {"title": "Program", "value": vehicle["program"]},
+            {"title": "Location", "value": vehicle["location"]},
+            {"title": "Comments", "value": vehicle.get("comments") or "—"},
+        ]
     payload = {
         "type": "message",
         "attachments": [{
@@ -208,13 +227,7 @@ def notify_teams(vehicle, member, assignment_type):
                 "type": "AdaptiveCard", "version": "1.4",
                 "body": [
                     {"type": "TextBlock", "text": notification_title, "weight": "Bolder", "size": "Medium"},
-                    {"type": "FactSet", "facts": [
-                        {"title": "VIN", "value": vehicle["vin"]},
-                        {"title": "Assigned to", "value": member["name"]},
-                        {"title": "Program", "value": vehicle["program"]},
-                        {"title": "Location", "value": vehicle["location"]},
-                        {"title": "Comments", "value": vehicle.get("comments") or "—"}
-                    ]}
+                    {"type": "FactSet", "facts": facts}
                 ]
             }
         }]
@@ -562,6 +575,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not vehicle or not member:
                 return self.send_json({"error": "Vehicle or selected teammate is no longer available."}, 409)
             old_id, stamp = vehicle["assigned_to"], now_iso()
+            previous_member = execute(db, "SELECT name FROM members WHERE id=?", (old_id,)).fetchone()
             execute(db, "UPDATE vehicles SET previous_assignee=?,assigned_to=?,assignment_type='Manual',assigned_at=?,reassignment_reason=? WHERE id=?",
                        (old_id, new_member_id, stamp, reason, vehicle_id))
             execute(db, "UPDATE members SET overall_load=overall_load+1,manual_count=manual_count+1 WHERE id=?", (new_member_id,))
@@ -570,6 +584,8 @@ class Handler(SimpleHTTPRequestHandler):
             execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
                        (vehicle_id, "Reassigned", new_member_id, reason, stamp))
             result_vehicle, result_member = dict(vehicle), dict(member)
+            result_vehicle["previous_name"] = previous_member["name"] if previous_member else ""
+            result_vehicle["reassignment_reason"] = reason
         sent = notify_teams(result_vehicle, result_member, "Reassigned")
         self.send_json({"ok": True, "assignedTo": result_member["name"], "teamsSent": sent})
 
