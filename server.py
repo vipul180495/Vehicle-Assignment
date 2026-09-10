@@ -135,9 +135,13 @@ def begin_write(db):
         db.execute("BEGIN IMMEDIATE")
 
 
-def decrement_expression(column):
-    fn = "GREATEST" if USE_POSTGRES else "MAX"
-    return f"{fn}(0,{column}-1)"
+def recalculate_member_load(db, member_id):
+    execute(db, """
+      UPDATE members SET current_load=(
+        SELECT COUNT(*) FROM vehicles
+        WHERE vehicles.assigned_to=members.id AND vehicles.status='Assigned'
+      ) WHERE id=?
+    """, (member_id,))
 
 
 def assign_oldest_waiting(db, member_id):
@@ -536,7 +540,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "Vehicle is not currently assigned."}, 409)
             stamp = now_iso()
             execute(db, "UPDATE vehicles SET status='Completed',completed_at=? WHERE id=?", (stamp, vehicle_id))
-            execute(db, f"UPDATE members SET current_load={decrement_expression('current_load')} WHERE id=?", (vehicle["assigned_to"],))
+            recalculate_member_load(db, vehicle["assigned_to"])
             execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,created_at) VALUES(?,?,?,?)",
                        (vehicle_id, "Completed", vehicle["assigned_to"], stamp))
             next_assignment = assign_oldest_waiting(db, vehicle["assigned_to"])
@@ -560,8 +564,9 @@ class Handler(SimpleHTTPRequestHandler):
             old_id, stamp = vehicle["assigned_to"], now_iso()
             execute(db, "UPDATE vehicles SET previous_assignee=?,assigned_to=?,assignment_type='Manual',assigned_at=?,reassignment_reason=? WHERE id=?",
                        (old_id, new_member_id, stamp, reason, vehicle_id))
-            execute(db, f"UPDATE members SET current_load={decrement_expression('current_load')} WHERE id=?", (old_id,))
-            execute(db, "UPDATE members SET current_load=current_load+1,overall_load=overall_load+1,manual_count=manual_count+1 WHERE id=?", (new_member_id,))
+            execute(db, "UPDATE members SET overall_load=overall_load+1,manual_count=manual_count+1 WHERE id=?", (new_member_id,))
+            recalculate_member_load(db, old_id)
+            recalculate_member_load(db, new_member_id)
             execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
                        (vehicle_id, "Reassigned", new_member_id, reason, stamp))
             result_vehicle, result_member = dict(vehicle), dict(member)
