@@ -385,6 +385,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/admin/vehicles/") and path.endswith("/notify"):
                 if not self.require_role("admin"): return
                 return self.resend_assignment_notification(int(path.split("/")[4]))
+            if path.startswith("/api/admin/vehicles/") and path.endswith("/delete"):
+                if not self.require_role("admin"): return
+                return self.delete_duplicate_vehicle(int(path.split("/")[4]))
             if path == "/api/vehicles":
                 if not self.require_role("manager"): return
                 return self.create_vehicle(data)
@@ -526,6 +529,69 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"error": "Teams did not accept the notification. Check the webhook and Render logs."}, 502)
         self.send_json({"ok": True, "vin": vehicle_data["vin"],
                         "assignedTo": vehicle_data["assigned_name"]})
+
+    def delete_duplicate_vehicle(self, vehicle_id):
+        """Remove one mistaken duplicate and undo its current-period counters."""
+        next_assignment = None
+        with DB_LOCK, connect() as db:
+            begin_write(db)
+            vehicle = execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            if not vehicle:
+                return self.send_json({"error": "Vehicle entry not found."}, 404)
+            duplicate_count = execute(
+                db, "SELECT COUNT(*) AS total FROM vehicles WHERE vin=?", (vehicle["vin"],)
+            ).fetchone()["total"]
+            if duplicate_count < 2:
+                return self.send_json({"error": "This VIN has no duplicate entry."}, 409)
+
+            archive = execute(
+                db, "SELECT MAX(exported_at) AS cutoff FROM monthly_archives"
+            ).fetchone()
+            cutoff = archive["cutoff"] if archive else None
+            vehicle_events = rows(
+                db,
+                "SELECT event_type,member_id,details,created_at FROM events WHERE vehicle_id=?",
+                (vehicle_id,),
+            )
+            adjustments = {}
+            for event in vehicle_events:
+                if not event["member_id"] or (cutoff and event["created_at"] <= cutoff):
+                    continue
+                auto_delta = manual_delta = 0
+                if event["event_type"] == "Assigned":
+                    if str(event.get("details") or "").lower().startswith("manual"):
+                        manual_delta = 1
+                    else:
+                        auto_delta = 1
+                elif event["event_type"] == "Reassigned":
+                    manual_delta = 1
+                if auto_delta or manual_delta:
+                    current = adjustments.setdefault(event["member_id"], [0, 0])
+                    current[0] += auto_delta
+                    current[1] += manual_delta
+
+            freed_member_id = vehicle["assigned_to"] if vehicle["status"] == "Assigned" else None
+            execute(db, "DELETE FROM events WHERE vehicle_id=?", (vehicle_id,))
+            execute(db, "DELETE FROM vehicles WHERE id=?", (vehicle_id,))
+            for member_id, (auto_delta, manual_delta) in adjustments.items():
+                total_delta = auto_delta + manual_delta
+                execute(db, """
+                  UPDATE members SET
+                    auto_count=CASE WHEN auto_count>=? THEN auto_count-? ELSE 0 END,
+                    manual_count=CASE WHEN manual_count>=? THEN manual_count-? ELSE 0 END,
+                    overall_load=CASE WHEN overall_load>=? THEN overall_load-? ELSE 0 END
+                  WHERE id=?
+                """, (auto_delta, auto_delta, manual_delta, manual_delta,
+                      total_delta, total_delta, member_id))
+            if freed_member_id:
+                recalculate_member_load(db, freed_member_id)
+                next_assignment = assign_oldest_waiting(db, freed_member_id)
+
+        if next_assignment:
+            queued_vehicle, free_member = next_assignment
+            safe_notify_teams(queued_vehicle, free_member, "Auto")
+        self.send_json({"ok": True, "vin": vehicle["vin"],
+                        "autoAssigned": next_assignment[0]["vin"] if next_assignment else None})
 
     def create_vehicle(self, data):
         vin = str(data["vin"]).strip().upper()
