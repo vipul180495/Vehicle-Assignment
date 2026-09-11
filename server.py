@@ -330,6 +330,12 @@ def safe_notify_teams(vehicle, member, assignment_type):
 
 
 class Handler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        path = urlparse(self.path).path
+        if path.endswith((".html", ".js", ".css")):
+            self.send_header("Cache-Control", "no-store, max-age=0")
+        super().end_headers()
+
     def redirect_login(self, destination):
         self.send_response(302)
         self.send_header("Location", f"/login?next={destination}")
