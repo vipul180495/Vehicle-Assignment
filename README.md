@@ -32,7 +32,7 @@ $env:TEAMS_WEBHOOK_URL = "PASTE_YOUR_WORKFLOW_WEBHOOK_URL"
 python server.py
 ```
 
-Every new assignment and reassignment posts an Adaptive Card with the VIN, teammate, program, location, assignment type, and comments. Assignment still succeeds if Teams is temporarily unavailable; the server logs the notification failure.
+Assignments, reassignments, completions, holds, and resumptions post an Adaptive Card with the relevant vehicle details. Vehicle operations still succeed if Teams is temporarily unavailable; the server logs the notification failure.
 
 ## Business rules implemented
 
@@ -41,6 +41,8 @@ Every new assignment and reassignment posts an Adaptive Card with the VIN, teamm
 - Manual assignment uses the manager's selected available teammate.
 - Assignment increments current load, overall load, and the corresponding auto/manual count in one database transaction.
 - Teammates complete or reassign their active vehicles from the Team Board.
+- An active vehicle can be placed On Hold with a reason. It remains owned by its engineer but no longer consumes their active capacity, allowing another vehicle to be assigned.
+- When external work is finished, Resume starts the held vehicle immediately if its engineer is free. Otherwise it becomes Ready and automatically resumes, ahead of queued work, when that engineer becomes free.
 - Completion decrements current load but preserves historical totals.
 - Reassignment frees the old teammate and increments the new teammate's manual and overall totals.
 - The same VIN can be submitted again for a later work assignment; each submission is stored as a separate record. Concurrent requests cannot assign the same work item twice.

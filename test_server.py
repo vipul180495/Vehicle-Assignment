@@ -86,6 +86,50 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
                 1,
             )
 
+    def test_hold_frees_engineer_and_assigns_oldest_queue(self):
+        active_id = self.seed_vehicle("ACTIVE100", "Assigned")
+        queued_id = self.seed_vehicle("QUEUE100", "Queued", assigned=False)
+        with server.connect() as db:
+            server.execute(
+                db,
+                "UPDATE members SET current_load=1,overall_load=1,auto_count=1 WHERE id=1",
+            )
+
+        response = ResponseRecorder()
+        server.Handler.hold_vehicle(response, active_id, {"reason": "Waiting for electrical team"})
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.value["autoAssigned"], "QUEUE100")
+        with server.connect() as db:
+            held = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (active_id,)).fetchone()
+            queued = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (queued_id,)).fetchone()
+            member = server.execute(db, "SELECT * FROM members WHERE id=1").fetchone()
+            self.assertEqual(held["status"], "On Hold")
+            self.assertEqual(held["hold_reason"], "Waiting for electrical team")
+            self.assertEqual(queued["status"], "Assigned")
+            self.assertEqual(member["current_load"], 1)
+            self.assertEqual(member["overall_load"], 2)
+
+    def test_ready_vehicle_resumes_before_new_queue_after_completion(self):
+        current_id = self.seed_vehicle("CURRENT100", "Assigned")
+        ready_id = self.seed_vehicle("READY100", "Ready")
+        self.seed_vehicle("QUEUE200", "Queued", assigned=False)
+        with server.connect() as db:
+            server.execute(db, "UPDATE vehicles SET hold_reason='External work complete' WHERE id=?", (ready_id,))
+            server.execute(db, "UPDATE members SET current_load=1,overall_load=2,auto_count=2 WHERE id=1")
+
+        response = ResponseRecorder()
+        server.Handler.complete_vehicle(response, current_id)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.value["resumed"], "READY100")
+        self.assertIsNone(response.value["autoAssigned"])
+        with server.connect() as db:
+            ready = server.execute(db, "SELECT status FROM vehicles WHERE id=?", (ready_id,)).fetchone()
+            queued = server.execute(db, "SELECT status FROM vehicles WHERE vin='QUEUE200'").fetchone()
+            self.assertEqual(ready["status"], "Assigned")
+            self.assertEqual(queued["status"], "Queued")
+
 
 if __name__ == "__main__":
     unittest.main()

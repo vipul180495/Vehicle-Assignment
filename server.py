@@ -81,6 +81,7 @@ def init_db():
           status TEXT NOT NULL DEFAULT 'Queued', assigned_to INTEGER,
           assignment_type TEXT, assigned_at TEXT, completed_at TEXT,
           previous_assignee INTEGER, reassignment_reason TEXT,
+          hold_reason TEXT, held_at TEXT,
           FOREIGN KEY(assigned_to) REFERENCES members(id),
           FOREIGN KEY(previous_assignee) REFERENCES members(id)
         );
@@ -109,6 +110,8 @@ def init_db():
             # Earlier versions treated VIN as unique. A vehicle can return for
             # another work assignment, so remove that legacy restriction.
             db.execute("ALTER TABLE vehicles DROP CONSTRAINT IF EXISTS vehicles_vin_key")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS hold_reason TEXT")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS held_at TEXT")
             for member in SEED_MEMBERS:
                 db.execute(
                     "INSERT INTO members(id,name,location) VALUES(%s,%s,%s) ON CONFLICT (id) DO NOTHING",
@@ -116,6 +119,11 @@ def init_db():
                 )
         else:
             db.executescript(schema)
+            vehicle_columns = {row["name"] for row in db.execute("PRAGMA table_info(vehicles)")}
+            if "hold_reason" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN hold_reason TEXT")
+            if "held_at" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN held_at TEXT")
             db.executemany(
                 "INSERT OR IGNORE INTO members(id,name,location) VALUES(?,?,?)", SEED_MEMBERS
             )
@@ -185,6 +193,44 @@ def assign_oldest_waiting(db, member_id):
     return dict(vehicle), dict(member)
 
 
+def resume_oldest_held(db, member_id):
+    """Resume this teammate's oldest ready vehicle before taking new queue work."""
+    member_lock = " FOR UPDATE" if USE_POSTGRES else ""
+    member = execute(
+        db,
+        "SELECT * FROM members WHERE id=? AND available_today=1 AND current_load=0" + member_lock,
+        (member_id,),
+    ).fetchone()
+    if not member:
+        return None
+    vehicle_lock = " FOR UPDATE SKIP LOCKED" if USE_POSTGRES else ""
+    vehicle = execute(
+        db,
+        "SELECT * FROM vehicles WHERE assigned_to=? AND status='Ready' "
+        "ORDER BY held_at,id LIMIT 1" + vehicle_lock,
+        (member_id,),
+    ).fetchone()
+    if not vehicle:
+        return None
+    stamp = now_iso()
+    updated = execute(
+        db,
+        "UPDATE vehicles SET status='Assigned' WHERE id=? AND status='Ready'",
+        (vehicle["id"],),
+    ).rowcount
+    if updated != 1:
+        return None
+    recalculate_member_load(db, member_id)
+    execute(
+        db,
+        "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+        (vehicle["id"], "Resumed", member_id, vehicle["hold_reason"], stamp),
+    )
+    result = dict(vehicle)
+    result["status"] = "Assigned"
+    return result, dict(member)
+
+
 def rows(db, sql, args=()):
     return [dict(row) for row in execute(db, sql, args).fetchall()]
 
@@ -200,7 +246,26 @@ def notify_teams(vehicle, member, assignment_type):
     notification_title = "Vehicle assigned"
     reassigned = assignment_type == "Reassigned"
     completed = assignment_type == "Completed"
-    if completed:
+    held = assignment_type == "On Hold"
+    resumed = assignment_type == "Resumed"
+    if held:
+        notification_title = "Vehicle On Hold"
+        facts = [
+            {"title": "VIN", "value": vehicle["vin"]},
+            {"title": "Engineer", "value": member["name"]},
+            {"title": "Program", "value": vehicle["program"]},
+            {"title": "Reason", "value": vehicle.get("hold_reason") or "—"},
+            {"title": "Location", "value": vehicle["location"]},
+        ]
+    elif resumed:
+        notification_title = "Vehicle Resumed"
+        facts = [
+            {"title": "VIN", "value": vehicle["vin"]},
+            {"title": "Engineer", "value": member["name"]},
+            {"title": "Program", "value": vehicle["program"]},
+            {"title": "Location", "value": vehicle["location"]},
+        ]
+    elif completed:
         notification_title = "✅ Vehicle Completed"
         facts = [
             {"title": "VIN", "value": vehicle["vin"]},
@@ -322,7 +387,7 @@ class Handler(SimpleHTTPRequestHandler):
                   SELECT v.*, m.name assigned_name, p.name previous_name
                   FROM vehicles v LEFT JOIN members m ON m.id=v.assigned_to
                   LEFT JOIN members p ON p.id=v.previous_assignee
-                  ORDER BY CASE v.status WHEN 'Assigned' THEN 0 WHEN 'Queued' THEN 1 ELSE 2 END,
+                  ORDER BY CASE v.status WHEN 'Assigned' THEN 0 WHEN 'Ready' THEN 1 WHEN 'On Hold' THEN 2 WHEN 'Queued' THEN 3 ELSE 4 END,
                            COALESCE(v.assigned_at, v.completed_at, '') DESC, v.id DESC
                 """)
             return self.send_json({"members": members, "vehicles": vehicles,
@@ -397,6 +462,12 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/vehicles/") and path.endswith("/complete"):
                 if not self.require_role("team"): return
                 return self.complete_vehicle(int(path.split("/")[3]))
+            if path.startswith("/api/vehicles/") and path.endswith("/hold"):
+                if not self.require_role("team"): return
+                return self.hold_vehicle(int(path.split("/")[3]), data)
+            if path.startswith("/api/vehicles/") and path.endswith("/resume"):
+                if not self.require_role("team"): return
+                return self.resume_vehicle(int(path.split("/")[3]))
             if path.startswith("/api/vehicles/") and path.endswith("/reassign"):
                 if not self.require_role("team"): return
                 return self.reassign_vehicle(int(path.split("/")[3]), data)
@@ -451,7 +522,8 @@ class Handler(SimpleHTTPRequestHandler):
                      COALESCE(e.details,'') details
               FROM events e JOIN vehicles v ON v.id=e.vehicle_id
               LEFT JOIN members m ON m.id=e.member_id
-              WHERE e.created_at LIKE ? AND e.event_type IN ('Assigned','Reassigned','Completed')
+              WHERE e.created_at LIKE ? AND e.event_type IN
+                    ('Assigned','Reassigned','On Hold','Ready','Resumed','Completed')
               ORDER BY e.created_at, e.id
             """, (month + "%",))
         output = io.StringIO(newline="")
@@ -651,6 +723,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def complete_vehicle(self, vehicle_id):
         next_assignment = None
+        next_kind = None
         completed_vehicle = None
         completed_member = None
         with DB_LOCK, connect() as db:
@@ -664,17 +737,98 @@ class Handler(SimpleHTTPRequestHandler):
             recalculate_member_load(db, vehicle["assigned_to"])
             execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,created_at) VALUES(?,?,?,?)",
                        (vehicle_id, "Completed", vehicle["assigned_to"], stamp))
-            next_assignment = assign_oldest_waiting(db, vehicle["assigned_to"])
+            next_assignment = resume_oldest_held(db, vehicle["assigned_to"])
+            next_kind = "Resumed" if next_assignment else None
+            if not next_assignment:
+                next_assignment = assign_oldest_waiting(db, vehicle["assigned_to"])
+                next_kind = "Auto" if next_assignment else None
             completed_vehicle = dict(vehicle)
             completed_member = dict(member) if member else {"name": "Unknown"}
         completed_sent = safe_notify_teams(completed_vehicle, completed_member, "Completed")
         if next_assignment:
+            next_vehicle, free_member = next_assignment
+            queue_sent = safe_notify_teams(next_vehicle, free_member, next_kind)
+            return self.send_json({"ok": True,
+                                   "autoAssigned": next_vehicle["vin"] if next_kind == "Auto" else None,
+                                   "resumed": next_vehicle["vin"] if next_kind == "Resumed" else None,
+                                   "assignedTo": free_member["name"], "teamsSent": completed_sent,
+                                   "queueTeamsSent": queue_sent})
+        self.send_json({"ok": True, "autoAssigned": None, "resumed": None,
+                        "teamsSent": completed_sent})
+
+    def hold_vehicle(self, vehicle_id, data):
+        reason = str(data.get("reason", "")).strip()
+        if not reason:
+            return self.send_json({"error": "Enter why this vehicle is waiting."}, 400)
+        next_assignment = None
+        with DB_LOCK, connect() as db:
+            begin_write(db)
+            vehicle = execute(
+                db, "SELECT * FROM vehicles WHERE id=? AND status='Assigned'", (vehicle_id,)
+            ).fetchone()
+            if not vehicle:
+                return self.send_json({"error": "Vehicle is not currently assigned."}, 409)
+            member = execute(db, "SELECT * FROM members WHERE id=?", (vehicle["assigned_to"],)).fetchone()
+            stamp = now_iso()
+            execute(
+                db,
+                "UPDATE vehicles SET status='On Hold',hold_reason=?,held_at=? WHERE id=?",
+                (reason, stamp, vehicle_id),
+            )
+            recalculate_member_load(db, vehicle["assigned_to"])
+            execute(
+                db,
+                "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                (vehicle_id, "On Hold", vehicle["assigned_to"], reason, stamp),
+            )
+            next_assignment = assign_oldest_waiting(db, vehicle["assigned_to"])
+            held_vehicle = dict(vehicle)
+            held_vehicle["hold_reason"] = reason
+            held_member = dict(member) if member else {"name": "Unknown"}
+        held_sent = safe_notify_teams(held_vehicle, held_member, "On Hold")
+        if next_assignment:
             queued_vehicle, free_member = next_assignment
             queue_sent = safe_notify_teams(queued_vehicle, free_member, "Auto")
             return self.send_json({"ok": True, "autoAssigned": queued_vehicle["vin"],
-                                   "assignedTo": free_member["name"], "teamsSent": completed_sent,
+                                   "assignedTo": free_member["name"], "teamsSent": held_sent,
                                    "queueTeamsSent": queue_sent})
-        self.send_json({"ok": True, "autoAssigned": None, "teamsSent": completed_sent})
+        self.send_json({"ok": True, "autoAssigned": None, "teamsSent": held_sent})
+
+    def resume_vehicle(self, vehicle_id):
+        with DB_LOCK, connect() as db:
+            begin_write(db)
+            vehicle = execute(
+                db, "SELECT * FROM vehicles WHERE id=? AND status IN ('On Hold','Ready')", (vehicle_id,)
+            ).fetchone()
+            if not vehicle:
+                return self.send_json({"error": "Vehicle is not currently on hold."}, 409)
+            lock = " FOR UPDATE" if USE_POSTGRES else ""
+            member = execute(
+                db,
+                "SELECT * FROM members WHERE id=? AND available_today=1 AND current_load=0" + lock,
+                (vehicle["assigned_to"],),
+            ).fetchone()
+            if not member:
+                if vehicle["status"] != "Ready":
+                    stamp = now_iso()
+                    execute(db, "UPDATE vehicles SET status='Ready' WHERE id=?", (vehicle_id,))
+                    execute(
+                        db,
+                        "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                        (vehicle_id, "Ready", vehicle["assigned_to"], vehicle["hold_reason"], stamp),
+                    )
+                return self.send_json({"ok": True, "vin": vehicle["vin"], "pending": True})
+            stamp = now_iso()
+            execute(db, "UPDATE vehicles SET status='Assigned' WHERE id=?", (vehicle_id,))
+            recalculate_member_load(db, vehicle["assigned_to"])
+            execute(
+                db,
+                "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                (vehicle_id, "Resumed", vehicle["assigned_to"], vehicle["hold_reason"], stamp),
+            )
+            result_vehicle, result_member = dict(vehicle), dict(member)
+        sent = safe_notify_teams(result_vehicle, result_member, "Resumed")
+        self.send_json({"ok": True, "vin": result_vehicle["vin"], "teamsSent": sent})
 
     def reassign_vehicle(self, vehicle_id, data):
         new_member_id = int(data["memberId"])
@@ -704,17 +858,24 @@ class Handler(SimpleHTTPRequestHandler):
     def set_availability(self, member_id, data):
         available = 1 if data.get("available") else 0
         next_assignment = None
+        next_kind = None
         with DB_LOCK, connect() as db:
             begin_write(db)
             execute(db, "UPDATE members SET available_today=? WHERE id=?", (available, member_id))
             if available:
-                next_assignment = assign_oldest_waiting(db, member_id)
+                next_assignment = resume_oldest_held(db, member_id)
+                next_kind = "Resumed" if next_assignment else None
+                if not next_assignment:
+                    next_assignment = assign_oldest_waiting(db, member_id)
+                    next_kind = "Auto" if next_assignment else None
         if next_assignment:
-            queued_vehicle, free_member = next_assignment
-            sent = safe_notify_teams(queued_vehicle, free_member, "Auto")
-            return self.send_json({"ok": True, "autoAssigned": queued_vehicle["vin"],
+            next_vehicle, free_member = next_assignment
+            sent = safe_notify_teams(next_vehicle, free_member, next_kind)
+            return self.send_json({"ok": True,
+                                   "autoAssigned": next_vehicle["vin"] if next_kind == "Auto" else None,
+                                   "resumed": next_vehicle["vin"] if next_kind == "Resumed" else None,
                                    "assignedTo": free_member["name"], "teamsSent": sent})
-        self.send_json({"ok": True, "autoAssigned": None})
+        self.send_json({"ok": True, "autoAssigned": None, "resumed": None})
 
 
 if __name__ == "__main__":
