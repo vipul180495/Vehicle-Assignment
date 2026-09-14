@@ -501,7 +501,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not self.require_role("team"): return
                 return self.resume_vehicle(int(path.split("/")[3]))
             if path.startswith("/api/vehicles/") and path.endswith("/reassign"):
-                if not self.require_role("team"): return
+                if not self.require_role("manager"): return
                 return self.reassign_vehicle(int(path.split("/")[3]), data)
             if path.startswith("/api/members/") and path.endswith("/availability"):
                 if not self.require_role("team"): return
