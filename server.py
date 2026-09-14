@@ -248,7 +248,27 @@ def notify_teams(vehicle, member, assignment_type):
     completed = assignment_type == "Completed"
     held = assignment_type == "On Hold"
     resumed = assignment_type == "Resumed"
-    if held:
+    cancelled = assignment_type == "Cancelled"
+    corrected = assignment_type == "Corrected"
+    if corrected:
+        notification_title = "Vehicle Details Corrected"
+        facts = [
+            {"title": "VIN", "value": vehicle["vin"]},
+            {"title": "Engineer", "value": member["name"]},
+            {"title": "Program", "value": vehicle["program"]},
+            {"title": "Location", "value": vehicle["location"]},
+            {"title": "Comments", "value": vehicle.get("comments") or "—"},
+        ]
+    elif cancelled:
+        notification_title = "Assignment Cancelled"
+        facts = [
+            {"title": "VIN", "value": vehicle["vin"]},
+            {"title": "Engineer", "value": member["name"]},
+            {"title": "Program", "value": vehicle["program"]},
+            {"title": "Location", "value": vehicle["location"]},
+            {"title": "Reason", "value": "Manager correction"},
+        ]
+    elif held:
         notification_title = "Vehicle On Hold"
         facts = [
             {"title": "VIN", "value": vehicle["vin"]},
@@ -465,6 +485,12 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/vehicles/") and path.endswith("/assign"):
                 if not self.require_role("manager"): return
                 return self.assign_vehicle(int(path.split("/")[3]), data)
+            if path.startswith("/api/vehicles/") and path.endswith("/edit"):
+                if not self.require_role("manager"): return
+                return self.edit_vehicle(int(path.split("/")[3]), data)
+            if path.startswith("/api/vehicles/") and path.endswith("/cancel-assignment"):
+                if not self.require_role("manager"): return
+                return self.cancel_assignment(int(path.split("/")[3]))
             if path.startswith("/api/vehicles/") and path.endswith("/complete"):
                 if not self.require_role("team"): return
                 return self.complete_vehicle(int(path.split("/")[3]))
@@ -529,7 +555,8 @@ class Handler(SimpleHTTPRequestHandler):
               FROM events e JOIN vehicles v ON v.id=e.vehicle_id
               LEFT JOIN members m ON m.id=e.member_id
               WHERE e.created_at LIKE ? AND e.event_type IN
-                    ('Assigned','Reassigned','On Hold','Ready','Resumed','Completed')
+                    ('Assigned','Reassigned','On Hold','Ready','Resumed','Completed',
+                     'Corrected','Assignment Cancelled')
               ORDER BY e.created_at, e.id
             """, (month + "%",))
         output = io.StringIO(newline="")
@@ -690,6 +717,72 @@ class Handler(SimpleHTTPRequestHandler):
         if data.get("assignMode") in ("Auto", "Manual"):
             return self.assign_vehicle(vehicle_id, data)
         self.send_json({"ok": True, "id": vehicle_id}, 201)
+
+    def edit_vehicle(self, vehicle_id, data):
+        vin = str(data.get("vin", "")).strip().upper()
+        program = str(data.get("program", "")).strip()
+        location = str(data.get("location", "")).strip()
+        comments = str(data.get("comments", "")).strip()
+        if not vin or program not in PROGRAMS or location not in ("FREC", "CTC"):
+            return self.send_json({"error": "Enter a VIN and select a valid program and location."}, 400)
+        assigned_member = None
+        with DB_LOCK, connect() as db:
+            begin_write(db)
+            vehicle = execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            if not vehicle:
+                return self.send_json({"error": "Vehicle entry not found."}, 404)
+            if vehicle["status"] == "Completed":
+                return self.send_json({"error": "Completed vehicle history cannot be edited."}, 409)
+            details = f"Corrected {vehicle['vin']} / {vehicle['program']} / {vehicle['location']}"
+            execute(db, "UPDATE vehicles SET vin=?,program=?,location=?,comments=? WHERE id=?",
+                    (vin, program, location, comments, vehicle_id))
+            execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                    (vehicle_id, "Corrected", vehicle["assigned_to"], details, now_iso()))
+            if vehicle["assigned_to"]:
+                assigned_member = execute(
+                    db, "SELECT * FROM members WHERE id=?", (vehicle["assigned_to"],)
+                ).fetchone()
+        sent = False
+        if assigned_member:
+            sent = safe_notify_teams(
+                {"vin": vin, "program": program, "location": location, "comments": comments},
+                dict(assigned_member), "Corrected"
+            )
+        self.send_json({"ok": True, "vin": vin, "teamsSent": sent})
+
+    def cancel_assignment(self, vehicle_id):
+        with DB_LOCK, connect() as db:
+            begin_write(db)
+            vehicle = execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            if not vehicle or vehicle["status"] not in ("Assigned", "On Hold", "Ready"):
+                return self.send_json({"error": "This vehicle has no active assignment to cancel."}, 409)
+            member = execute(db, "SELECT * FROM members WHERE id=?", (vehicle["assigned_to"],)).fetchone()
+            assignment_event = execute(db, """
+              SELECT * FROM events WHERE vehicle_id=? AND member_id=?
+              AND event_type IN ('Assigned','Reassigned') ORDER BY created_at DESC,id DESC LIMIT 1
+            """, (vehicle_id, vehicle["assigned_to"])).fetchone()
+            archive = execute(db, "SELECT MAX(exported_at) AS cutoff FROM monthly_archives").fetchone()
+            cutoff = archive["cutoff"] if archive else None
+            if assignment_event and (not cutoff or assignment_event["created_at"] > cutoff):
+                manual = assignment_event["event_type"] == "Reassigned" or str(
+                    assignment_event["details"] or "").lower().startswith("manual")
+                field = "manual_count" if manual else "auto_count"
+                execute(db, f"""
+                  UPDATE members SET {field}=CASE WHEN {field}>0 THEN {field}-1 ELSE 0 END,
+                  overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?
+                """, (vehicle["assigned_to"],))
+            execute(db, """
+              UPDATE vehicles SET status='Queued',assigned_to=NULL,assignment_type=NULL,
+              assigned_at=NULL,completed_at=NULL,previous_assignee=NULL,
+              reassignment_reason=NULL,hold_reason=NULL,held_at=NULL WHERE id=?
+            """, (vehicle_id,))
+            recalculate_member_load(db, vehicle["assigned_to"])
+            execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                    (vehicle_id, "Assignment Cancelled", vehicle["assigned_to"], "Manager correction", now_iso()))
+            vehicle_data = dict(vehicle)
+            member_data = dict(member) if member else {"name": "Unknown"}
+        sent = safe_notify_teams(vehicle_data, member_data, "Cancelled")
+        self.send_json({"ok": True, "vin": vehicle_data["vin"], "teamsSent": sent})
 
     def assign_vehicle(self, vehicle_id, data):
         mode = data.get("assignMode", "Auto")

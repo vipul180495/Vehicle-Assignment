@@ -39,6 +39,7 @@ Assignments, reassignments, completions, holds, and resumptions post an Adaptive
 - Auto assignment chooses an available teammate in the same location with no active vehicle and the lowest overall assignment count.
 - If nobody is available, the vehicle remains queued. The oldest same-location queued vehicle is automatically assigned when a teammate completes a vehicle or becomes available.
 - Manual assignment uses the manager's selected available teammate.
+- Managers can correct VIN, program, location, and comments on non-completed records. They can also undo a mistaken assignment, returning the vehicle to the queue and reversing its current-period count.
 - Assignment increments current load, overall load, and the corresponding auto/manual count in one database transaction.
 - Teammates complete or reassign their active vehicles from the Team Board.
 - An active vehicle can be placed On Hold with a reason. It remains owned by its engineer but no longer consumes their active capacity, allowing another vehicle to be assigned.

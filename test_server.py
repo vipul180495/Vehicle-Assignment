@@ -130,6 +130,33 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(ready["status"], "Assigned")
             self.assertEqual(queued["status"], "Queued")
 
+    def test_manager_can_correct_then_cancel_mistaken_assignment(self):
+        vehicle_id = self.seed_vehicle("WRONG100", "Assigned")
+        with server.connect() as db:
+            server.execute(
+                db, "UPDATE members SET current_load=1,overall_load=1,auto_count=1 WHERE id=1"
+            )
+        response = ResponseRecorder()
+
+        server.Handler.edit_vehicle(response, vehicle_id, {
+            "vin": "RIGHT100", "program": "HDCC", "location": "CTC", "comments": "Corrected"
+        })
+        self.assertEqual(response.status, 200)
+        server.Handler.cancel_assignment(response, vehicle_id)
+
+        self.assertEqual(response.status, 200)
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            member = server.execute(db, "SELECT * FROM members WHERE id=1").fetchone()
+            self.assertEqual(vehicle["vin"], "RIGHT100")
+            self.assertEqual(vehicle["program"], "HDCC")
+            self.assertEqual(vehicle["location"], "CTC")
+            self.assertEqual(vehicle["status"], "Queued")
+            self.assertIsNone(vehicle["assigned_to"])
+            self.assertEqual(member["current_load"], 0)
+            self.assertEqual(member["overall_load"], 0)
+            self.assertEqual(member["auto_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
