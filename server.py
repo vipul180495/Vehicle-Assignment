@@ -81,7 +81,7 @@ def init_db():
           status TEXT NOT NULL DEFAULT 'Queued', assigned_to INTEGER,
           assignment_type TEXT, assigned_at TEXT, completed_at TEXT,
           previous_assignee INTEGER, reassignment_reason TEXT,
-          hold_reason TEXT, held_at TEXT,
+          hold_reason TEXT, held_at TEXT, cancellation_reason TEXT, cancelled_at TEXT,
           FOREIGN KEY(assigned_to) REFERENCES members(id),
           FOREIGN KEY(previous_assignee) REFERENCES members(id)
         );
@@ -112,6 +112,8 @@ def init_db():
             db.execute("ALTER TABLE vehicles DROP CONSTRAINT IF EXISTS vehicles_vin_key")
             db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS hold_reason TEXT")
             db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS held_at TEXT")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS cancellation_reason TEXT")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS cancelled_at TEXT")
             for member in SEED_MEMBERS:
                 db.execute(
                     "INSERT INTO members(id,name,location) VALUES(%s,%s,%s) ON CONFLICT (id) DO NOTHING",
@@ -124,6 +126,10 @@ def init_db():
                 db.execute("ALTER TABLE vehicles ADD COLUMN hold_reason TEXT")
             if "held_at" not in vehicle_columns:
                 db.execute("ALTER TABLE vehicles ADD COLUMN held_at TEXT")
+            if "cancellation_reason" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN cancellation_reason TEXT")
+            if "cancelled_at" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN cancelled_at TEXT")
             db.executemany(
                 "INSERT OR IGNORE INTO members(id,name,location) VALUES(?,?,?)", SEED_MEMBERS
             )
@@ -249,6 +255,7 @@ def notify_teams(vehicle, member, assignment_type):
     held = assignment_type == "On Hold"
     resumed = assignment_type == "Resumed"
     cancelled = assignment_type == "Cancelled"
+    vehicle_cancelled = assignment_type == "Vehicle Cancelled"
     corrected = assignment_type == "Corrected"
     assignee_corrected = assignment_type == "Assignee Corrected"
     if corrected or assignee_corrected:
@@ -262,6 +269,15 @@ def notify_teams(vehicle, member, assignment_type):
         ]
         if assignee_corrected:
             facts.insert(2, {"title": "Previous Engineer", "value": vehicle.get("previous_name") or "—"})
+    elif vehicle_cancelled:
+        notification_title = "Vehicle Cancelled"
+        facts = [
+            {"title": "VIN", "value": vehicle["vin"]},
+            {"title": "Engineer", "value": member["name"]},
+            {"title": "Program", "value": vehicle["program"]},
+            {"title": "Location", "value": vehicle["location"]},
+            {"title": "Reason", "value": vehicle.get("cancellation_reason") or "—"},
+        ]
     elif cancelled:
         notification_title = "Assignment Cancelled"
         facts = [
@@ -494,6 +510,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/vehicles/") and path.endswith("/cancel-assignment"):
                 if not self.require_role("manager"): return
                 return self.cancel_assignment(int(path.split("/")[3]))
+            if path.startswith("/api/vehicles/") and path.endswith("/cancel-vehicle"):
+                if not self.require_role("manager"): return
+                return self.cancel_vehicle(int(path.split("/")[3]), data)
             if path.startswith("/api/vehicles/") and path.endswith("/complete"):
                 if not self.require_role("team"): return
                 return self.complete_vehicle(int(path.split("/")[3]))
@@ -559,7 +578,7 @@ class Handler(SimpleHTTPRequestHandler):
               LEFT JOIN members m ON m.id=e.member_id
               WHERE e.created_at LIKE ? AND e.event_type IN
                     ('Assigned','Reassigned','On Hold','Ready','Resumed','Completed',
-                     'Corrected','Assignee Corrected','Assignment Cancelled')
+                     'Corrected','Assignee Corrected','Assignment Cancelled','Vehicle Cancelled')
               ORDER BY e.created_at, e.id
             """, (month + "%",))
         output = io.StringIO(newline="")
@@ -825,6 +844,51 @@ class Handler(SimpleHTTPRequestHandler):
             member_data = dict(member) if member else {"name": "Unknown"}
         sent = safe_notify_teams(vehicle_data, member_data, "Cancelled")
         self.send_json({"ok": True, "vin": vehicle_data["vin"], "teamsSent": sent})
+
+    def cancel_vehicle(self, vehicle_id, data):
+        reason = str(data.get("reason", "")).strip()
+        if not reason:
+            return self.send_json({"error": "Enter why this vehicle is being cancelled."}, 400)
+        next_assignment = None
+        next_kind = None
+        with DB_LOCK, connect() as db:
+            begin_write(db)
+            vehicle = execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            if not vehicle:
+                return self.send_json({"error": "Vehicle entry not found."}, 404)
+            if vehicle["status"] in ("Completed", "Cancelled"):
+                return self.send_json({"error": "This vehicle is already final and cannot be cancelled."}, 409)
+            member = None
+            member_id = vehicle["assigned_to"]
+            if member_id:
+                member = execute(db, "SELECT * FROM members WHERE id=?", (member_id,)).fetchone()
+            stamp = now_iso()
+            execute(db, """
+              UPDATE vehicles SET status='Cancelled',cancellation_reason=?,cancelled_at=? WHERE id=?
+            """, (reason, stamp, vehicle_id))
+            execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                    (vehicle_id, "Vehicle Cancelled", member_id, reason, stamp))
+            if member_id:
+                recalculate_member_load(db, member_id)
+                next_assignment = resume_oldest_held(db, member_id)
+                next_kind = "Resumed" if next_assignment else None
+                if not next_assignment:
+                    next_assignment = assign_oldest_waiting(db, member_id)
+                    next_kind = "Auto" if next_assignment else None
+            vehicle_data = dict(vehicle)
+            vehicle_data["cancellation_reason"] = reason
+            member_data = dict(member) if member else {"name": "Unassigned"}
+        cancelled_sent = safe_notify_teams(vehicle_data, member_data, "Vehicle Cancelled")
+        if next_assignment:
+            next_vehicle, free_member = next_assignment
+            next_sent = safe_notify_teams(next_vehicle, free_member, next_kind)
+            return self.send_json({"ok": True, "vin": vehicle_data["vin"],
+                                   "autoAssigned": next_vehicle["vin"] if next_kind == "Auto" else None,
+                                   "resumed": next_vehicle["vin"] if next_kind == "Resumed" else None,
+                                   "assignedTo": free_member["name"], "teamsSent": cancelled_sent,
+                                   "nextTeamsSent": next_sent})
+        self.send_json({"ok": True, "vin": vehicle_data["vin"], "autoAssigned": None,
+                        "resumed": None, "teamsSent": cancelled_sent})
 
     def assign_vehicle(self, vehicle_id, data):
         mode = data.get("assignMode", "Auto")

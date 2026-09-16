@@ -182,6 +182,25 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(new_member["overall_load"], 1)
             self.assertEqual(new_member["auto_count"], 1)
 
+    def test_permanent_cancel_is_final_and_preserves_assignment_count(self):
+        vehicle_id = self.seed_vehicle("CANCEL100", "Assigned")
+        with server.connect() as db:
+            server.execute(db, "UPDATE members SET current_load=1,overall_load=1,auto_count=1 WHERE id=1")
+        response = ResponseRecorder()
+
+        server.Handler.cancel_vehicle(response, vehicle_id, {"reason": "Vehicle removed from program"})
+
+        self.assertEqual(response.status, 200)
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            member = server.execute(db, "SELECT * FROM members WHERE id=1").fetchone()
+            self.assertEqual(vehicle["status"], "Cancelled")
+            self.assertEqual(vehicle["cancellation_reason"], "Vehicle removed from program")
+            self.assertIsNotNone(vehicle["cancelled_at"])
+            self.assertEqual(member["current_load"], 0)
+            self.assertEqual(member["overall_load"], 1)
+            self.assertEqual(member["auto_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
