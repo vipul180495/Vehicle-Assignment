@@ -250,8 +250,9 @@ def notify_teams(vehicle, member, assignment_type):
     resumed = assignment_type == "Resumed"
     cancelled = assignment_type == "Cancelled"
     corrected = assignment_type == "Corrected"
-    if corrected:
-        notification_title = "Vehicle Details Corrected"
+    assignee_corrected = assignment_type == "Assignee Corrected"
+    if corrected or assignee_corrected:
+        notification_title = "Assignment Corrected" if assignee_corrected else "Vehicle Details Corrected"
         facts = [
             {"title": "VIN", "value": vehicle["vin"]},
             {"title": "Engineer", "value": member["name"]},
@@ -259,6 +260,8 @@ def notify_teams(vehicle, member, assignment_type):
             {"title": "Location", "value": vehicle["location"]},
             {"title": "Comments", "value": vehicle.get("comments") or "—"},
         ]
+        if assignee_corrected:
+            facts.insert(2, {"title": "Previous Engineer", "value": vehicle.get("previous_name") or "—"})
     elif cancelled:
         notification_title = "Assignment Cancelled"
         facts = [
@@ -556,7 +559,7 @@ class Handler(SimpleHTTPRequestHandler):
               LEFT JOIN members m ON m.id=e.member_id
               WHERE e.created_at LIKE ? AND e.event_type IN
                     ('Assigned','Reassigned','On Hold','Ready','Resumed','Completed',
-                     'Corrected','Assignment Cancelled')
+                     'Corrected','Assignee Corrected','Assignment Cancelled')
               ORDER BY e.created_at, e.id
             """, (month + "%",))
         output = io.StringIO(newline="")
@@ -723,6 +726,7 @@ class Handler(SimpleHTTPRequestHandler):
         program = str(data.get("program", "")).strip()
         location = str(data.get("location", "")).strip()
         comments = str(data.get("comments", "")).strip()
+        requested_member_id = int(data["memberId"]) if data.get("memberId") else None
         if not vin or program not in PROGRAMS or location not in ("FREC", "CTC"):
             return self.send_json({"error": "Enter a VIN and select a valid program and location."}, 400)
         assigned_member = None
@@ -733,22 +737,60 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "Vehicle entry not found."}, 404)
             if vehicle["status"] == "Completed":
                 return self.send_json({"error": "Completed vehicle history cannot be edited."}, 409)
+            old_member_id = vehicle["assigned_to"]
+            new_member_id = old_member_id
+            assignee_changed = False
+            previous_member = None
+            if old_member_id and requested_member_id and requested_member_id != old_member_id:
+                lock = " FOR UPDATE" if USE_POSTGRES else ""
+                new_member = execute(
+                    db, "SELECT * FROM members WHERE id=? AND available_today=1 AND current_load=0" + lock,
+                    (requested_member_id,),
+                ).fetchone()
+                if not new_member:
+                    return self.send_json({"error": "The selected teammate is no longer available."}, 409)
+                previous_member = execute(db, "SELECT * FROM members WHERE id=?", (old_member_id,)).fetchone()
+                assignment_event = execute(db, """
+                  SELECT * FROM events WHERE vehicle_id=? AND member_id=?
+                  AND event_type IN ('Assigned','Reassigned') ORDER BY created_at DESC,id DESC LIMIT 1
+                """, (vehicle_id, old_member_id)).fetchone()
+                archive = execute(db, "SELECT MAX(exported_at) AS cutoff FROM monthly_archives").fetchone()
+                cutoff = archive["cutoff"] if archive else None
+                if assignment_event and (not cutoff or assignment_event["created_at"] > cutoff):
+                    manual = assignment_event["event_type"] == "Reassigned" or str(
+                        assignment_event["details"] or "").lower().startswith("manual")
+                    field = "manual_count" if manual else "auto_count"
+                    execute(db, f"""
+                      UPDATE members SET {field}=CASE WHEN {field}>0 THEN {field}-1 ELSE 0 END,
+                      overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?
+                    """, (old_member_id,))
+                    execute(db, f"UPDATE members SET {field}={field}+1,overall_load=overall_load+1 WHERE id=?",
+                            (requested_member_id,))
+                new_member_id = requested_member_id
+                assignee_changed = True
             details = f"Corrected {vehicle['vin']} / {vehicle['program']} / {vehicle['location']}"
-            execute(db, "UPDATE vehicles SET vin=?,program=?,location=?,comments=? WHERE id=?",
-                    (vin, program, location, comments, vehicle_id))
+            execute(db, "UPDATE vehicles SET vin=?,program=?,location=?,comments=?,assigned_to=? WHERE id=?",
+                    (vin, program, location, comments, new_member_id, vehicle_id))
             execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
-                    (vehicle_id, "Corrected", vehicle["assigned_to"], details, now_iso()))
-            if vehicle["assigned_to"]:
+                    (vehicle_id, "Assignee Corrected" if assignee_changed else "Corrected",
+                     new_member_id, details, now_iso()))
+            if assignee_changed:
+                recalculate_member_load(db, old_member_id)
+                recalculate_member_load(db, new_member_id)
+            if new_member_id:
                 assigned_member = execute(
-                    db, "SELECT * FROM members WHERE id=?", (vehicle["assigned_to"],)
+                    db, "SELECT * FROM members WHERE id=?", (new_member_id,)
                 ).fetchone()
         sent = False
         if assigned_member:
-            sent = safe_notify_teams(
-                {"vin": vin, "program": program, "location": location, "comments": comments},
-                dict(assigned_member), "Corrected"
-            )
-        self.send_json({"ok": True, "vin": vin, "teamsSent": sent})
+            notification_vehicle = {"vin": vin, "program": program, "location": location,
+                                    "comments": comments}
+            if previous_member:
+                notification_vehicle["previous_name"] = previous_member["name"]
+            sent = safe_notify_teams(notification_vehicle, dict(assigned_member),
+                                     "Assignee Corrected" if previous_member else "Corrected")
+        self.send_json({"ok": True, "vin": vin, "teamsSent": sent,
+                        "assigneeChanged": bool(previous_member)})
 
     def cancel_assignment(self, vehicle_id):
         with DB_LOCK, connect() as db:

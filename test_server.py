@@ -157,6 +157,31 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(member["overall_load"], 0)
             self.assertEqual(member["auto_count"], 0)
 
+    def test_edit_can_transfer_mistaken_assignee_and_count(self):
+        vehicle_id = self.seed_vehicle("ASSIGNEE100", "Assigned")
+        with server.connect() as db:
+            server.execute(db, "UPDATE members SET current_load=1,overall_load=1,auto_count=1 WHERE id=1")
+        response = ResponseRecorder()
+
+        server.Handler.edit_vehicle(response, vehicle_id, {
+            "vin": "ASSIGNEE100", "program": "DT ICE", "location": "FREC",
+            "comments": "", "memberId": 2,
+        })
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(response.value["assigneeChanged"])
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            old_member = server.execute(db, "SELECT * FROM members WHERE id=1").fetchone()
+            new_member = server.execute(db, "SELECT * FROM members WHERE id=2").fetchone()
+            self.assertEqual(vehicle["assigned_to"], 2)
+            self.assertEqual(old_member["current_load"], 0)
+            self.assertEqual(old_member["overall_load"], 0)
+            self.assertEqual(old_member["auto_count"], 0)
+            self.assertEqual(new_member["current_load"], 1)
+            self.assertEqual(new_member["overall_load"], 1)
+            self.assertEqual(new_member["auto_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
