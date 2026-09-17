@@ -514,7 +514,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not self.require_role("manager"): return
                 return self.cancel_vehicle(int(path.split("/")[3]), data)
             if path.startswith("/api/vehicles/") and path.endswith("/complete"):
-                if not self.require_role("team"): return
+                if not self.require_role("team", "manager"): return
                 return self.complete_vehicle(int(path.split("/")[3]))
             if path.startswith("/api/vehicles/") and path.endswith("/hold"):
                 if not self.require_role("team", "manager"): return
