@@ -862,6 +862,20 @@ class Handler(SimpleHTTPRequestHandler):
             member_id = vehicle["assigned_to"]
             if member_id:
                 member = execute(db, "SELECT * FROM members WHERE id=?", (member_id,)).fetchone()
+                assignment_event = execute(db, """
+                  SELECT * FROM events WHERE vehicle_id=? AND member_id=?
+                  AND event_type IN ('Assigned','Reassigned') ORDER BY created_at DESC,id DESC LIMIT 1
+                """, (vehicle_id, member_id)).fetchone()
+                archive = execute(db, "SELECT MAX(exported_at) AS cutoff FROM monthly_archives").fetchone()
+                cutoff = archive["cutoff"] if archive else None
+                if assignment_event and (not cutoff or assignment_event["created_at"] > cutoff):
+                    manual = assignment_event["event_type"] == "Reassigned" or str(
+                        assignment_event["details"] or "").lower().startswith("manual")
+                    field = "manual_count" if manual else "auto_count"
+                    execute(db, f"""
+                      UPDATE members SET {field}=CASE WHEN {field}>0 THEN {field}-1 ELSE 0 END,
+                      overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?
+                    """, (member_id,))
             stamp = now_iso()
             execute(db, """
               UPDATE vehicles SET status='Cancelled',cancellation_reason=?,cancelled_at=? WHERE id=?
