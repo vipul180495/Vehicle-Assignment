@@ -201,6 +201,27 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(member["overall_load"], 0)
             self.assertEqual(member["auto_count"], 0)
 
+    def test_external_work_is_recorded_without_changing_home_location(self):
+        response = ResponseRecorder()
+        server.Handler.create_external_work(response, {
+            "vin": "EXT100", "program": "DT ICE", "location": "Auburn Hills",
+            "comments": "Assigned directly on site", "memberId": 1,
+            "status": "Assigned", "assignedDate": "2026-09-23", "sendTeams": False,
+        })
+
+        self.assertEqual(response.status, 200)
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE vin='EXT100'").fetchone()
+            member = server.execute(db, "SELECT * FROM members WHERE id=1").fetchone()
+            self.assertEqual(vehicle["assignment_type"], "External")
+            self.assertEqual(vehicle["status"], "Assigned")
+            self.assertEqual(vehicle["location"], "AUBURN HILLS")
+            self.assertEqual(member["location"], "FREC")
+            self.assertEqual(member["current_load"], 1)
+            self.assertEqual(member["overall_load"], 1)
+            self.assertEqual(member["auto_count"], 0)
+            self.assertEqual(member["manual_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

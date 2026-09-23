@@ -258,7 +258,18 @@ def notify_teams(vehicle, member, assignment_type):
     vehicle_cancelled = assignment_type == "Vehicle Cancelled"
     corrected = assignment_type == "Corrected"
     assignee_corrected = assignment_type == "Assignee Corrected"
-    if corrected or assignee_corrected:
+    external = assignment_type == "External"
+    if external:
+        notification_title = "External Work Recorded"
+        facts = [
+            {"title": "VIN", "value": vehicle["vin"]},
+            {"title": "Engineer", "value": member["name"]},
+            {"title": "Program", "value": vehicle["program"]},
+            {"title": "Location", "value": vehicle["location"]},
+            {"title": "Status", "value": vehicle.get("status") or "Assigned"},
+            {"title": "Comments", "value": vehicle.get("comments") or "—"},
+        ]
+    elif corrected or assignee_corrected:
         notification_title = "Assignment Corrected" if assignee_corrected else "Vehicle Details Corrected"
         facts = [
             {"title": "VIN", "value": vehicle["vin"]},
@@ -501,6 +512,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/vehicles":
                 if not self.require_role("manager"): return
                 return self.create_vehicle(data)
+            if path == "/api/vehicles/external":
+                if not self.require_role("manager"): return
+                return self.create_external_work(data)
             if path.startswith("/api/vehicles/") and path.endswith("/assign"):
                 if not self.require_role("manager"): return
                 return self.assign_vehicle(int(path.split("/")[3]), data)
@@ -618,17 +632,19 @@ class Handler(SimpleHTTPRequestHandler):
     def correct_member_counts(self, member_id, data):
         auto_count = int(data.get("autoCount", 0))
         manual_count = int(data.get("manualCount", 0))
-        if auto_count < 0 or manual_count < 0:
+        external_count = int(data.get("externalCount", 0))
+        if auto_count < 0 or manual_count < 0 or external_count < 0:
             return self.send_json({"error": "Counts cannot be negative."}, 400)
+        total = auto_count + manual_count + external_count
         with DB_LOCK, connect() as db:
             updated = execute(
                 db,
                 "UPDATE members SET auto_count=?,manual_count=?,overall_load=? WHERE id=?",
-                (auto_count, manual_count, auto_count + manual_count, member_id),
+                (auto_count, manual_count, total, member_id),
             ).rowcount
             if updated != 1:
                 return self.send_json({"error": "Teammate not found."}, 404)
-        self.send_json({"ok": True, "overallLoad": auto_count + manual_count})
+        self.send_json({"ok": True, "overallLoad": total})
 
     def recalculate_current_loads(self):
         with DB_LOCK, connect() as db:
@@ -651,7 +667,8 @@ class Handler(SimpleHTTPRequestHandler):
         if not vehicle:
             return self.send_json({"error": "Only an active assigned vehicle can be notified."}, 409)
         vehicle_data = dict(vehicle)
-        sent = safe_notify_teams(vehicle_data, {"name": vehicle_data["assigned_name"]}, "Auto")
+        sent = safe_notify_teams(vehicle_data, {"name": vehicle_data["assigned_name"]},
+                                 vehicle_data.get("assignment_type") or "Auto")
         if not sent:
             return self.send_json({"error": "Teams did not accept the notification. Check the webhook and Render logs."}, 502)
         self.send_json({"ok": True, "vin": vehicle_data["vin"],
@@ -720,6 +737,55 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"ok": True, "vin": vehicle["vin"],
                         "autoAssigned": next_assignment[0]["vin"] if next_assignment else None})
 
+    def create_external_work(self, data):
+        vin = str(data.get("vin", "")).strip().upper()
+        program = str(data.get("program", "")).strip()
+        location = str(data.get("location", "")).strip().upper()
+        comments = str(data.get("comments", "")).strip()
+        member_id = int(data.get("memberId", 0))
+        work_status = str(data.get("status", "Assigned"))
+        assigned_date = str(data.get("assignedDate", "")).strip()
+        completed_date = str(data.get("completedDate", "")).strip()
+        if not vin or program not in PROGRAMS or not location or work_status not in ("Assigned", "Completed"):
+            return self.send_json({"error": "Enter valid external work details."}, 400)
+        date_pattern = r"\d{4}-\d{2}-\d{2}"
+        if assigned_date and not re.fullmatch(date_pattern, assigned_date):
+            return self.send_json({"error": "Assigned date must be a valid date."}, 400)
+        if completed_date and not re.fullmatch(date_pattern, completed_date):
+            return self.send_json({"error": "Completion date must be a valid date."}, 400)
+        assigned_at = assigned_date + "T12:00:00+00:00" if assigned_date else now_iso()
+        completed_at = (completed_date or assigned_date) + "T12:00:00+00:00" if work_status == "Completed" and (completed_date or assigned_date) else (now_iso() if work_status == "Completed" else None)
+        with DB_LOCK, connect() as db:
+            begin_write(db)
+            member = execute(db, "SELECT * FROM members WHERE id=?", (member_id,)).fetchone()
+            if not member:
+                return self.send_json({"error": "Select a valid teammate."}, 400)
+            insert = """
+              INSERT INTO vehicles(vin,program,location,comments,status,assigned_to,
+                                   assignment_type,assigned_at,completed_at)
+              VALUES(?,?,?,?,?,?,?,?,?)
+            """
+            if USE_POSTGRES:
+                insert += " RETURNING id"
+            cursor = execute(db, insert, (vin, program, location, comments, work_status, member_id,
+                                          "External", assigned_at, completed_at))
+            vehicle_id = cursor.fetchone()["id"] if USE_POSTGRES else cursor.lastrowid
+            execute(db, "UPDATE members SET overall_load=overall_load+1 WHERE id=?", (member_id,))
+            recalculate_member_load(db, member_id)
+            stamp = completed_at or assigned_at
+            execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                    (vehicle_id, "Assigned", member_id, "External", assigned_at))
+            if work_status == "Completed":
+                execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                        (vehicle_id, "Completed", member_id, "External work recorded as completed", stamp))
+            vehicle = {"id": vehicle_id, "vin": vin, "program": program, "location": location,
+                       "comments": comments, "status": work_status, "assignment_type": "External"}
+            member_data = dict(member)
+        send_teams = bool(data.get("sendTeams"))
+        sent = safe_notify_teams(vehicle, member_data, "External") if send_teams else False
+        self.send_json({"ok": True, "vin": vin, "assignedTo": member_data["name"],
+                        "status": work_status, "teamsSent": sent})
+
     def create_vehicle(self, data):
         vin = str(data["vin"]).strip().upper()
         program = str(data["program"]).strip()
@@ -746,7 +812,7 @@ class Handler(SimpleHTTPRequestHandler):
         location = str(data.get("location", "")).strip()
         comments = str(data.get("comments", "")).strip()
         requested_member_id = int(data["memberId"]) if data.get("memberId") else None
-        if not vin or program not in PROGRAMS or location not in ("FREC", "CTC"):
+        if not vin or program not in PROGRAMS or not location or len(location) > 50:
             return self.send_json({"error": "Enter a VIN and select a valid program and location."}, 400)
         assigned_member = None
         with DB_LOCK, connect() as db:
@@ -778,13 +844,18 @@ class Handler(SimpleHTTPRequestHandler):
                 if assignment_event and (not cutoff or assignment_event["created_at"] > cutoff):
                     manual = assignment_event["event_type"] == "Reassigned" or str(
                         assignment_event["details"] or "").lower().startswith("manual")
-                    field = "manual_count" if manual else "auto_count"
-                    execute(db, f"""
-                      UPDATE members SET {field}=CASE WHEN {field}>0 THEN {field}-1 ELSE 0 END,
-                      overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?
-                    """, (old_member_id,))
-                    execute(db, f"UPDATE members SET {field}={field}+1,overall_load=overall_load+1 WHERE id=?",
-                            (requested_member_id,))
+                    external = str(assignment_event["details"] or "").lower().startswith("external")
+                    if external:
+                        execute(db, "UPDATE members SET overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?", (old_member_id,))
+                        execute(db, "UPDATE members SET overall_load=overall_load+1 WHERE id=?", (requested_member_id,))
+                    else:
+                        field = "manual_count" if manual else "auto_count"
+                        execute(db, f"""
+                          UPDATE members SET {field}=CASE WHEN {field}>0 THEN {field}-1 ELSE 0 END,
+                          overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?
+                        """, (old_member_id,))
+                        execute(db, f"UPDATE members SET {field}={field}+1,overall_load=overall_load+1 WHERE id=?",
+                                (requested_member_id,))
                 new_member_id = requested_member_id
                 assignee_changed = True
             details = f"Corrected {vehicle['vin']} / {vehicle['program']} / {vehicle['location']}"
@@ -827,11 +898,15 @@ class Handler(SimpleHTTPRequestHandler):
             if assignment_event and (not cutoff or assignment_event["created_at"] > cutoff):
                 manual = assignment_event["event_type"] == "Reassigned" or str(
                     assignment_event["details"] or "").lower().startswith("manual")
-                field = "manual_count" if manual else "auto_count"
-                execute(db, f"""
-                  UPDATE members SET {field}=CASE WHEN {field}>0 THEN {field}-1 ELSE 0 END,
-                  overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?
-                """, (vehicle["assigned_to"],))
+                external = str(assignment_event["details"] or "").lower().startswith("external")
+                if external:
+                    execute(db, "UPDATE members SET overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?", (vehicle["assigned_to"],))
+                else:
+                    field = "manual_count" if manual else "auto_count"
+                    execute(db, f"""
+                      UPDATE members SET {field}=CASE WHEN {field}>0 THEN {field}-1 ELSE 0 END,
+                      overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?
+                    """, (vehicle["assigned_to"],))
             execute(db, """
               UPDATE vehicles SET status='Queued',assigned_to=NULL,assignment_type=NULL,
               assigned_at=NULL,completed_at=NULL,previous_assignee=NULL,
@@ -871,11 +946,15 @@ class Handler(SimpleHTTPRequestHandler):
                 if assignment_event and (not cutoff or assignment_event["created_at"] > cutoff):
                     manual = assignment_event["event_type"] == "Reassigned" or str(
                         assignment_event["details"] or "").lower().startswith("manual")
-                    field = "manual_count" if manual else "auto_count"
-                    execute(db, f"""
-                      UPDATE members SET {field}=CASE WHEN {field}>0 THEN {field}-1 ELSE 0 END,
-                      overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?
-                    """, (member_id,))
+                    external = str(assignment_event["details"] or "").lower().startswith("external")
+                    if external:
+                        execute(db, "UPDATE members SET overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?", (member_id,))
+                    else:
+                        field = "manual_count" if manual else "auto_count"
+                        execute(db, f"""
+                          UPDATE members SET {field}=CASE WHEN {field}>0 THEN {field}-1 ELSE 0 END,
+                          overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?
+                        """, (member_id,))
             stamp = now_iso()
             execute(db, """
               UPDATE vehicles SET status='Cancelled',cancellation_reason=?,cancelled_at=? WHERE id=?

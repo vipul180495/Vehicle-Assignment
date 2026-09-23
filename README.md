@@ -39,6 +39,7 @@ Assignments, reassignments, completions, holds, and resumptions post an Adaptive
 - Auto assignment chooses an available teammate in the same location with no active vehicle and the lowest overall assignment count.
 - If nobody is available, the vehicle remains queued. The oldest same-location queued vehicle is automatically assigned when a teammate completes a vehicle or becomes available.
 - Manual assignment uses the manager's selected available teammate.
+- Managers can record work received outside the app as External, either in progress or already completed, with an optional Teams notification. It counts toward Total Assignments without changing the teammate's home location.
 - Managers can correct VIN, program, location, and comments on non-completed records. They can also undo a mistaken assignment, returning the vehicle to the queue and reversing its current-period count.
 - Managers can permanently cancel a vehicle with a required reason. Cancelled vehicles never return to the queue; active capacity is freed and the current assignment count is reversed.
 - Assignment increments Active Vehicles, Total Assignments, and the corresponding auto/manual count in one database transaction.
@@ -57,7 +58,7 @@ For a pilot, run this on an always-on internal Windows PC/server and allow inbou
 
 The included `render.yaml` creates a free Render web service. Push this folder to a private GitHub repository, choose **New > Blueprint** in Render, connect the repository, and supply `DATABASE_URL`, `MANAGER_PASSWORD`, `TEAM_PASSWORD`, `ADMIN_PASSWORD`, and optionally `TEAMS_WEBHOOK_URL` when prompted. Render generates `COOKIE_SECRET` automatically.
 
-The Admin page at `/admin` can export a selected month's event history as CSV, correct each teammate's Auto/Manual counts, recalculate Active Vehicles, and archive/reset monthly Total, Auto, and Manual counters. Active Vehicles is never edited arbitrarily because it controls assignment availability.
+The Admin page at `/admin` can export a selected month's event history as CSV, correct each teammate's Auto/Manual/External counts, recalculate Active Vehicles, and archive/reset monthly counters. Active Vehicles is never edited arbitrarily because it controls assignment availability.
 
 For persistent storage on a free deployment, create a free Supabase project, copy its PostgreSQL connection string, and set it as Render's `DATABASE_URL`. Use the Supabase transaction pooler connection string when direct database connections are not available. The application uses local SQLite only when `DATABASE_URL` is absent.
 
