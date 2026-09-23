@@ -921,7 +921,7 @@ class Handler(SimpleHTTPRequestHandler):
                 lock = " FOR UPDATE SKIP LOCKED" if USE_POSTGRES else ""
                 member = execute(db, """
                   SELECT * FROM members WHERE available_today=1 AND current_load=0
-                  AND location=? ORDER BY overall_load, auto_count, id LIMIT 1
+                  AND location=? ORDER BY overall_load, id LIMIT 1
                 """ + lock, (vehicle["location"],)).fetchone()
             if not member:
                 return self.send_json({"error": "No available teammate for this location."}, 409)
