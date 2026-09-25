@@ -430,6 +430,11 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        history_match = re.fullmatch(r"/api/vehicles/(\d+)/history", path)
+        if history_match:
+            if not self.require_role("manager", "admin"):
+                return
+            return self.vehicle_history(int(history_match.group(1)))
         if path == "/api/admin/export":
             if not self.require_role("admin"):
                 return
@@ -610,6 +615,26 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def vehicle_history(self, vehicle_id):
+        with connect() as db:
+            vehicle = execute(db, "SELECT vin FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            if not vehicle:
+                return self.send_json({"error": "Vehicle entry not found."}, 404)
+            history = rows(db, """
+              SELECT e.event_type,e.details,e.created_at,e.member_id,m.name member_name
+              FROM events e LEFT JOIN members m ON m.id=e.member_id
+              WHERE e.vehicle_id=? ORDER BY e.created_at,e.id
+            """, (vehicle_id,))
+        previous_engineer = None
+        result = []
+        for event in history:
+            item = dict(event)
+            if event["event_type"] in ("Assigned", "Reassigned", "Assignee Corrected"):
+                item["previous_engineer"] = previous_engineer if event["event_type"] != "Assigned" else None
+                previous_engineer = event["member_name"] or previous_engineer
+            result.append(item)
+        self.send_json({"vin": vehicle["vin"], "history": result})
 
     def reset_monthly_counts(self, data):
         month = self.requested_month(data)

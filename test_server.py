@@ -222,6 +222,22 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(member["auto_count"], 0)
             self.assertEqual(member["manual_count"], 0)
 
+    def test_vehicle_history_tracks_previous_engineer_on_reassignment(self):
+        vehicle_id = self.seed_vehicle("HISTORY100", "Assigned")
+        with server.connect() as db:
+            server.execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                           (vehicle_id, "Reassigned", 2, "Coverage change", "2026-09-11T13:00:00+00:00"))
+        response = ResponseRecorder()
+
+        server.Handler.vehicle_history(response, vehicle_id)
+
+        self.assertEqual(response.status, 200)
+        reassigned = response.value["history"][-1]
+        self.assertEqual(reassigned["event_type"], "Reassigned")
+        self.assertEqual(reassigned["member_name"], "Elias Saleh")
+        self.assertEqual(reassigned["previous_engineer"], "Dheeraj Adabala")
+        self.assertEqual(reassigned["details"], "Coverage change")
+
 
 if __name__ == "__main__":
     unittest.main()

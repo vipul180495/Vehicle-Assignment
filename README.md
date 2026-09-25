@@ -41,6 +41,7 @@ Assignments, reassignments, completions, holds, and resumptions post an Adaptive
 - Manual assignment uses the manager's selected available teammate.
 - Managers can record work received outside the app as External, either in progress or already completed, with an optional Teams notification. It counts toward Total Assignments without changing the teammate's home location.
 - Managers can correct VIN, program, location, and comments on non-completed records. They can also undo a mistaken assignment, returning the vehicle to the queue and reversing its current-period count.
+- The Manager view marks reassigned vehicles, shows the latest previous engineer and reason, and provides a View History timeline for every vehicle, including completed records and multiple handoffs.
 - Managers can permanently cancel a vehicle with a required reason. Cancelled vehicles never return to the queue; active capacity is freed and the current assignment count is reversed.
 - Assignment increments Active Vehicles, Total Assignments, and the corresponding auto/manual count in one database transaction.
 - Teammates complete or reassign their active vehicles from the Team Board.
