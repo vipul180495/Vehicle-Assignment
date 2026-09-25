@@ -238,6 +238,31 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
         self.assertEqual(reassigned["previous_engineer"], "Dheeraj Adabala")
         self.assertEqual(reassigned["details"], "Coverage change")
 
+    def test_reassignment_frees_previous_engineer_without_changing_their_counts(self):
+        vehicle_id = self.seed_vehicle("REASSIGN100", "Assigned")
+        with server.connect() as db:
+            server.execute(db, "UPDATE members SET current_load=1,overall_load=4,auto_count=3,manual_count=1 WHERE id=1")
+            server.execute(db, "UPDATE members SET current_load=0,overall_load=2,auto_count=2,manual_count=0 WHERE id=2")
+        response = ResponseRecorder()
+
+        server.Handler.reassign_vehicle(response, vehicle_id, {
+            "memberId": 2, "reason": "Coverage change",
+        })
+
+        self.assertEqual(response.status, 200)
+        with server.connect() as db:
+            previous = server.execute(db, "SELECT * FROM members WHERE id=1").fetchone()
+            new = server.execute(db, "SELECT * FROM members WHERE id=2").fetchone()
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            self.assertEqual(previous["current_load"], 0)
+            self.assertEqual(previous["overall_load"], 4)
+            self.assertEqual(previous["auto_count"], 3)
+            self.assertEqual(previous["manual_count"], 1)
+            self.assertEqual(new["current_load"], 1)
+            self.assertEqual(new["overall_load"], 3)
+            self.assertEqual(new["manual_count"], 1)
+            self.assertEqual(vehicle["assigned_to"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
