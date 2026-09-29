@@ -82,6 +82,7 @@ def init_db():
           assignment_type TEXT, assigned_at TEXT, completed_at TEXT,
           previous_assignee INTEGER, reassignment_reason TEXT,
           hold_reason TEXT, held_at TEXT, cancellation_reason TEXT, cancelled_at TEXT,
+          ticket_assigned INTEGER NOT NULL DEFAULT 0, ticket_assigned_at TEXT,
           FOREIGN KEY(assigned_to) REFERENCES members(id),
           FOREIGN KEY(previous_assignee) REFERENCES members(id)
         );
@@ -114,6 +115,8 @@ def init_db():
             db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS held_at TEXT")
             db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS cancellation_reason TEXT")
             db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS cancelled_at TEXT")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS ticket_assigned INTEGER NOT NULL DEFAULT 0")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS ticket_assigned_at TEXT")
             for member in SEED_MEMBERS:
                 db.execute(
                     "INSERT INTO members(id,name,location) VALUES(%s,%s,%s) ON CONFLICT (id) DO NOTHING",
@@ -130,6 +133,10 @@ def init_db():
                 db.execute("ALTER TABLE vehicles ADD COLUMN cancellation_reason TEXT")
             if "cancelled_at" not in vehicle_columns:
                 db.execute("ALTER TABLE vehicles ADD COLUMN cancelled_at TEXT")
+            if "ticket_assigned" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN ticket_assigned INTEGER NOT NULL DEFAULT 0")
+            if "ticket_assigned_at" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN ticket_assigned_at TEXT")
             db.executemany(
                 "INSERT OR IGNORE INTO members(id,name,location) VALUES(?,?,?)", SEED_MEMBERS
             )
@@ -533,6 +540,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/vehicles/") and path.endswith("/cancel-vehicle"):
                 if not self.require_role("manager"): return
                 return self.cancel_vehicle(int(path.split("/")[3]), data)
+            if path.startswith("/api/vehicles/") and path.endswith("/assign-ticket"):
+                if not self.require_role("manager"): return
+                return self.assign_ticket(int(path.split("/")[3]))
             if path.startswith("/api/vehicles/") and path.endswith("/complete"):
                 if not self.require_role("team", "manager"): return
                 return self.complete_vehicle(int(path.split("/")[3]))
@@ -597,7 +607,7 @@ class Handler(SimpleHTTPRequestHandler):
               FROM events e JOIN vehicles v ON v.id=e.vehicle_id
               LEFT JOIN members m ON m.id=e.member_id
               WHERE e.created_at LIKE ? AND e.event_type IN
-                    ('Assigned','Reassigned','On Hold','Ready','Resumed','Completed',
+                    ('Assigned','Reassigned','On Hold','Ready','Resumed','Completed','Ticket Assigned',
                      'Corrected','Assignee Corrected','Assignment Cancelled','Vehicle Cancelled')
               ORDER BY e.created_at, e.id
             """, (month + "%",))
@@ -891,6 +901,8 @@ class Handler(SimpleHTTPRequestHandler):
                     (vehicle_id, "Assignee Corrected" if assignee_changed else "Corrected",
                      new_member_id, details, now_iso()))
             if assignee_changed:
+                execute(db, "UPDATE vehicles SET ticket_assigned=0,ticket_assigned_at=NULL WHERE id=?",
+                        (vehicle_id,))
                 recalculate_member_load(db, old_member_id)
                 recalculate_member_load(db, new_member_id)
             if new_member_id:
@@ -936,7 +948,8 @@ class Handler(SimpleHTTPRequestHandler):
             execute(db, """
               UPDATE vehicles SET status='Queued',assigned_to=NULL,assignment_type=NULL,
               assigned_at=NULL,completed_at=NULL,previous_assignee=NULL,
-              reassignment_reason=NULL,hold_reason=NULL,held_at=NULL WHERE id=?
+              reassignment_reason=NULL,hold_reason=NULL,held_at=NULL,
+              ticket_assigned=0,ticket_assigned_at=NULL WHERE id=?
             """, (vehicle_id,))
             recalculate_member_load(db, vehicle["assigned_to"])
             execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
@@ -1044,6 +1057,24 @@ class Handler(SimpleHTTPRequestHandler):
             result_vehicle, result_member = dict(vehicle), dict(member)
         sent = safe_notify_teams(result_vehicle, result_member, mode)
         self.send_json({"ok": True, "assignedTo": result_member["name"], "teamsSent": sent})
+
+    def assign_ticket(self, vehicle_id):
+        with DB_LOCK, connect() as db:
+            begin_write(db)
+            vehicle = execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            if not vehicle:
+                return self.send_json({"error": "Vehicle entry not found."}, 404)
+            if not vehicle["assigned_to"] or vehicle["status"] in ("Queued", "Cancelled"):
+                return self.send_json({"error": "A ticket can be recorded only after the vehicle is assigned."}, 409)
+            if vehicle["ticket_assigned"]:
+                return self.send_json({"ok": True, "vin": vehicle["vin"],
+                                       "ticketAssignedAt": vehicle["ticket_assigned_at"]})
+            stamp = now_iso()
+            execute(db, "UPDATE vehicles SET ticket_assigned=1,ticket_assigned_at=? WHERE id=?",
+                    (stamp, vehicle_id))
+            execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                    (vehicle_id, "Ticket Assigned", vehicle["assigned_to"], "Manager recorded ticket assignment", stamp))
+        self.send_json({"ok": True, "vin": vehicle["vin"], "ticketAssignedAt": stamp})
 
     def complete_vehicle(self, vehicle_id):
         next_assignment = None
@@ -1166,7 +1197,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "Vehicle or selected teammate is no longer available."}, 409)
             old_id, stamp = vehicle["assigned_to"], now_iso()
             previous_member = execute(db, "SELECT name FROM members WHERE id=?", (old_id,)).fetchone()
-            execute(db, "UPDATE vehicles SET previous_assignee=?,assigned_to=?,assignment_type='Manual',assigned_at=?,reassignment_reason=? WHERE id=?",
+            execute(db, "UPDATE vehicles SET previous_assignee=?,assigned_to=?,assignment_type='Manual',assigned_at=?,reassignment_reason=?,ticket_assigned=0,ticket_assigned_at=NULL WHERE id=?",
                        (old_id, new_member_id, stamp, reason, vehicle_id))
             execute(db, "UPDATE members SET overall_load=overall_load+1,manual_count=manual_count+1 WHERE id=?", (new_member_id,))
             recalculate_member_load(db, old_id)

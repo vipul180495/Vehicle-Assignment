@@ -263,6 +263,27 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(new["manual_count"], 1)
             self.assertEqual(vehicle["assigned_to"], 2)
 
+    def test_ticket_assignment_is_recorded_without_changing_workload_counts(self):
+        vehicle_id = self.seed_vehicle("TICKET100", "Assigned")
+        with server.connect() as db:
+            server.execute(db, "UPDATE members SET current_load=1,overall_load=3,auto_count=2,manual_count=1 WHERE id=1")
+        response = ResponseRecorder()
+
+        server.Handler.assign_ticket(response, vehicle_id)
+
+        self.assertEqual(response.status, 200)
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            member = server.execute(db, "SELECT * FROM members WHERE id=1").fetchone()
+            event = server.execute(db, "SELECT * FROM events WHERE vehicle_id=? AND event_type='Ticket Assigned'", (vehicle_id,)).fetchone()
+            self.assertEqual(vehicle["ticket_assigned"], 1)
+            self.assertIsNotNone(vehicle["ticket_assigned_at"])
+            self.assertIsNotNone(event)
+            self.assertEqual(member["current_load"], 1)
+            self.assertEqual(member["overall_load"], 3)
+            self.assertEqual(member["auto_count"], 2)
+            self.assertEqual(member["manual_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
