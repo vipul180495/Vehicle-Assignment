@@ -34,7 +34,7 @@ python server.py
 
 Assignments, reassignments, completions, holds, and resumptions post an Adaptive Card with the relevant vehicle details. Vehicle operations still succeed if Teams is temporarily unavailable; the server logs the notification failure.
 
-For a separate audit group, create a second Teams Workflow webhook and configure `AUDIT_TEAMS_WEBHOOK_URL`. On completion, users can either send the normal completion only or enter a Spot Number and also send an Audit Notification to that second group.
+For a separate audit group, create a second Teams Workflow webhook and configure `AUDIT_TEAMS_WEBHOOK_URL`. On completion, users can either send the normal completion to the regular group or enter a Spot Number and send only an Audit Notification to the audit group.
 
 ## Business rules implemented
 

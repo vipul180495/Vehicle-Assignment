@@ -1247,7 +1247,8 @@ class Handler(SimpleHTTPRequestHandler):
                 next_kind = "Auto" if next_assignment else None
             completed_vehicle = dict(vehicle)
             completed_member = dict(member) if member else {"name": "Unknown"}
-        completed_sent = safe_notify_teams(completed_vehicle, completed_member, "Completed")
+        completed_sent = (False if audit_requested else
+                          safe_notify_teams(completed_vehicle, completed_member, "Completed"))
         audit_sent = False
         audit_error = None
         if audit_requested:

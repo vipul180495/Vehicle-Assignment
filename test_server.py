@@ -351,7 +351,8 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(vehicle["status"], "Cancelled")
 
     @patch("server.notify_audit_teams", return_value=True)
-    def test_complete_can_send_vehicle_to_audit_group(self, notify_audit):
+    @patch("server.safe_notify_teams")
+    def test_complete_can_send_only_to_audit_group(self, regular_notify, notify_audit):
         vehicle_id = self.seed_vehicle("AUDIT100", "Assigned")
         with server.connect() as db:
             server.execute(db, "UPDATE members SET current_load=1,overall_load=1,auto_count=1 WHERE id=1")
@@ -362,6 +363,7 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertTrue(response.value["auditSent"])
         notify_audit.assert_called_once()
+        regular_notify.assert_not_called()
         with server.connect() as db:
             vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
             event = server.execute(db, "SELECT * FROM events WHERE vehicle_id=? AND event_type='Sent for Audit'", (vehicle_id,)).fetchone()
