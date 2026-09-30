@@ -333,6 +333,23 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(member["overall_load"], 1)
             self.assertEqual(member["manual_count"], 1)
 
+    @patch("server.safe_notify_teams")
+    def test_cancelling_upcoming_vehicle_does_not_send_teams_notification(self, notify):
+        created = ResponseRecorder()
+        server.Handler.create_upcoming_vehicle(created, {
+            "vin": "UPCOMINGCANCEL", "program": "DT ICE", "location": "FREC", "comments": "",
+        })
+        response = ResponseRecorder()
+
+        server.Handler.cancel_vehicle(response, created.value["id"], {"reason": "No longer expected"})
+
+        self.assertEqual(response.status, 200)
+        self.assertFalse(response.value["teamsSent"])
+        notify.assert_not_called()
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (created.value["id"],)).fetchone()
+            self.assertEqual(vehicle["status"], "Cancelled")
+
     @patch("server.notify_audit_teams", return_value=True)
     def test_complete_can_send_vehicle_to_audit_group(self, notify_audit):
         vehicle_id = self.seed_vehicle("AUDIT100", "Assigned")

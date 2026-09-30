@@ -1125,7 +1125,8 @@ class Handler(SimpleHTTPRequestHandler):
             vehicle_data = dict(vehicle)
             vehicle_data["cancellation_reason"] = reason
             member_data = dict(member) if member else {"name": "Unassigned"}
-        cancelled_sent = safe_notify_teams(vehicle_data, member_data, "Vehicle Cancelled")
+        cancelled_sent = (safe_notify_teams(vehicle_data, member_data, "Vehicle Cancelled")
+                          if vehicle_data["status"] != "Upcoming" else False)
         if next_assignment:
             next_vehicle, free_member = next_assignment
             next_sent = safe_notify_teams(next_vehicle, free_member, next_kind)
