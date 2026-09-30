@@ -500,7 +500,7 @@ class Handler(SimpleHTTPRequestHandler):
                   SELECT v.*, m.name assigned_name, p.name previous_name
                   FROM vehicles v LEFT JOIN members m ON m.id=v.assigned_to
                   LEFT JOIN members p ON p.id=v.previous_assignee
-                  ORDER BY CASE v.status WHEN 'Assigned' THEN 0 WHEN 'Ready' THEN 1 WHEN 'On Hold' THEN 2 WHEN 'Queued' THEN 3 ELSE 4 END,
+                  ORDER BY CASE v.status WHEN 'Upcoming' THEN 0 WHEN 'Assigned' THEN 1 WHEN 'Ready' THEN 2 WHEN 'On Hold' THEN 3 WHEN 'Queued' THEN 4 ELSE 5 END,
                            COALESCE(v.assigned_at, v.completed_at, '') DESC, v.id DESC
                 """)
             return self.send_json({"members": members, "vehicles": vehicles,
