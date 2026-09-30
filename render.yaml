@@ -21,3 +21,5 @@ services:
         sync: false
       - key: TEAMS_WEBHOOK_URL
         sync: false
+      - key: AUDIT_TEAMS_WEBHOOK_URL
+        sync: false

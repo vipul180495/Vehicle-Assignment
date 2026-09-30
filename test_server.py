@@ -1,5 +1,6 @@
 import gc
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import server
@@ -283,6 +284,50 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(member["overall_load"], 3)
             self.assertEqual(member["auto_count"], 2)
             self.assertEqual(member["manual_count"], 1)
+
+    def test_upcoming_vehicle_waits_until_arrival_then_auto_assigns(self):
+        created = ResponseRecorder()
+        server.Handler.create_upcoming_vehicle(created, {
+            "vin": "UPCOMING100", "program": "DT ICE", "location": "FREC", "comments": "Expected tomorrow",
+        })
+        vehicle_id = created.value["id"]
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            self.assertEqual(vehicle["status"], "Upcoming")
+            self.assertIsNone(vehicle["assigned_to"])
+
+        arrived = ResponseRecorder()
+        server.Handler.activate_upcoming_vehicle(arrived, vehicle_id)
+
+        self.assertEqual(arrived.status, 200)
+        self.assertEqual(arrived.value["assignedTo"], "Dheeraj Adabala")
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            member = server.execute(db, "SELECT * FROM members WHERE id=1").fetchone()
+            self.assertEqual(vehicle["status"], "Assigned")
+            self.assertEqual(vehicle["assigned_to"], 1)
+            self.assertEqual(member["current_load"], 1)
+            self.assertEqual(member["overall_load"], 1)
+
+    @patch("server.notify_audit_teams", return_value=True)
+    def test_complete_can_send_vehicle_to_audit_group(self, notify_audit):
+        vehicle_id = self.seed_vehicle("AUDIT100", "Assigned")
+        with server.connect() as db:
+            server.execute(db, "UPDATE members SET current_load=1,overall_load=1,auto_count=1 WHERE id=1")
+        response = ResponseRecorder()
+
+        server.Handler.complete_vehicle(response, vehicle_id, {"sendForAudit": True, "spot": "12"})
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(response.value["auditSent"])
+        notify_audit.assert_called_once()
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            event = server.execute(db, "SELECT * FROM events WHERE vehicle_id=? AND event_type='Sent for Audit'", (vehicle_id,)).fetchone()
+            self.assertEqual(vehicle["status"], "Completed")
+            self.assertEqual(vehicle["audit_sent"], 1)
+            self.assertEqual(vehicle["audit_spot"], "12")
+            self.assertIsNotNone(event)
 
 
 if __name__ == "__main__":

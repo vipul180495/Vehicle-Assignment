@@ -34,15 +34,19 @@ python server.py
 
 Assignments, reassignments, completions, holds, and resumptions post an Adaptive Card with the relevant vehicle details. Vehicle operations still succeed if Teams is temporarily unavailable; the server logs the notification failure.
 
+For a separate audit group, create a second Teams Workflow webhook and configure `AUDIT_TEAMS_WEBHOOK_URL`. On completion, users can either send the normal completion only or enter a Spot Number and also send an Audit Notification to that second group.
+
 ## Business rules implemented
 
 - Auto assignment chooses an available teammate in the same location with no active vehicle and the lowest overall assignment count.
 - If nobody is available, the vehicle remains queued. The oldest same-location queued vehicle is automatically assigned when a teammate completes a vehicle or becomes available.
+- Managers can add expected vehicles to Upcoming Vehicles without assigning them. Clicking Vehicle arrived moves one into the live queue and immediately attempts the normal balanced auto-assignment.
 - Manual assignment uses the manager's selected available teammate.
 - Managers can record work received outside the app as External, either in progress or already completed, with an optional Teams notification. It counts toward Total Assignments without changing the teammate's home location.
 - Managers can correct VIN, program, location, and comments on non-completed records. They can also undo a mistaken assignment, returning the vehicle to the queue and reversing its current-period count.
 - The Manager view marks reassigned vehicles, shows the latest previous engineer and reason, and provides a View History timeline for every vehicle, including completed records and multiple handoffs.
 - After a vehicle is assigned, managers can record ticket assignment with one click. The state is shown in the Manager actions, added to vehicle history and CSV exports, and never changes workload counts.
+- Completed vehicles record whether they were sent to Audit, their Spot Number, and the audit notification time in Vehicle History and CSV exports.
 - Managers can permanently cancel a vehicle with a required reason. Cancelled vehicles never return to the queue; active capacity is freed and the current assignment count is reversed.
 - Assignment increments Active Vehicles, Total Assignments, and the corresponding auto/manual count in one database transaction.
 - Teammates complete or reassign their active vehicles from the Team Board.

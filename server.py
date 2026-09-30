@@ -83,6 +83,7 @@ def init_db():
           previous_assignee INTEGER, reassignment_reason TEXT,
           hold_reason TEXT, held_at TEXT, cancellation_reason TEXT, cancelled_at TEXT,
           ticket_assigned INTEGER NOT NULL DEFAULT 0, ticket_assigned_at TEXT,
+          audit_sent INTEGER NOT NULL DEFAULT 0, audit_spot TEXT, audit_sent_at TEXT,
           FOREIGN KEY(assigned_to) REFERENCES members(id),
           FOREIGN KEY(previous_assignee) REFERENCES members(id)
         );
@@ -117,6 +118,9 @@ def init_db():
             db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS cancelled_at TEXT")
             db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS ticket_assigned INTEGER NOT NULL DEFAULT 0")
             db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS ticket_assigned_at TEXT")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS audit_sent INTEGER NOT NULL DEFAULT 0")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS audit_spot TEXT")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS audit_sent_at TEXT")
             for member in SEED_MEMBERS:
                 db.execute(
                     "INSERT INTO members(id,name,location) VALUES(%s,%s,%s) ON CONFLICT (id) DO NOTHING",
@@ -137,6 +141,12 @@ def init_db():
                 db.execute("ALTER TABLE vehicles ADD COLUMN ticket_assigned INTEGER NOT NULL DEFAULT 0")
             if "ticket_assigned_at" not in vehicle_columns:
                 db.execute("ALTER TABLE vehicles ADD COLUMN ticket_assigned_at TEXT")
+            if "audit_sent" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN audit_sent INTEGER NOT NULL DEFAULT 0")
+            if "audit_spot" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN audit_spot TEXT")
+            if "audit_sent_at" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN audit_sent_at TEXT")
             db.executemany(
                 "INSERT OR IGNORE INTO members(id,name,location) VALUES(?,?,?)", SEED_MEMBERS
             )
@@ -386,6 +396,40 @@ def safe_notify_teams(vehicle, member, assignment_type):
         return False
 
 
+def notify_audit_teams(vehicle, member, spot):
+    url = os.getenv("AUDIT_TEAMS_WEBHOOK_URL", "").strip()
+    if not url:
+        return False
+    message = (f"{member['name']} has finished working on {vehicle['program']} "
+               f"VIN {vehicle['vin']} and is now ready for Audit!")
+    payload = {
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive", "contentUrl": None,
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard", "version": "1.4",
+                "body": [
+                    {"type": "TextBlock", "text": "Audit Notification!", "weight": "Bolder", "size": "Medium"},
+                    {"type": "TextBlock", "text": message, "wrap": True},
+                    {"type": "FactSet", "facts": [
+                        {"title": "Spot", "value": spot},
+                        {"title": "Location", "value": vehicle["location"]},
+                    ]},
+                ],
+            },
+        }],
+    }
+    request = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            return 200 <= response.status < 300
+    except Exception as exc:
+        print(f"Audit Teams notification failed: {exc}")
+        return False
+
+
 class Handler(SimpleHTTPRequestHandler):
     def end_headers(self):
         path = urlparse(self.path).path
@@ -461,6 +505,7 @@ class Handler(SimpleHTTPRequestHandler):
                 """)
             return self.send_json({"members": members, "vehicles": vehicles,
                                    "teamsConfigured": bool(os.getenv("TEAMS_WEBHOOK_URL")),
+                                   "auditTeamsConfigured": bool(os.getenv("AUDIT_TEAMS_WEBHOOK_URL")),
                                    "role": self.role()})
         if path == "/api/session":
             return self.send_json({"role": self.role()})
@@ -528,6 +573,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/vehicles/external":
                 if not self.require_role("manager"): return
                 return self.create_external_work(data)
+            if path == "/api/vehicles/upcoming":
+                if not self.require_role("manager"): return
+                return self.create_upcoming_vehicle(data)
             if path.startswith("/api/vehicles/") and path.endswith("/assign"):
                 if not self.require_role("manager"): return
                 return self.assign_vehicle(int(path.split("/")[3]), data)
@@ -543,9 +591,15 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/vehicles/") and path.endswith("/assign-ticket"):
                 if not self.require_role("manager"): return
                 return self.assign_ticket(int(path.split("/")[3]))
+            if path.startswith("/api/vehicles/") and path.endswith("/arrive"):
+                if not self.require_role("manager"): return
+                return self.activate_upcoming_vehicle(int(path.split("/")[3]))
+            if path.startswith("/api/vehicles/") and path.endswith("/send-audit"):
+                if not self.require_role("manager"): return
+                return self.send_vehicle_for_audit(int(path.split("/")[3]), data)
             if path.startswith("/api/vehicles/") and path.endswith("/complete"):
                 if not self.require_role("team", "manager"): return
-                return self.complete_vehicle(int(path.split("/")[3]))
+                return self.complete_vehicle(int(path.split("/")[3]), data)
             if path.startswith("/api/vehicles/") and path.endswith("/hold"):
                 if not self.require_role("team", "manager"): return
                 return self.hold_vehicle(int(path.split("/")[3]), data)
@@ -607,7 +661,8 @@ class Handler(SimpleHTTPRequestHandler):
               FROM events e JOIN vehicles v ON v.id=e.vehicle_id
               LEFT JOIN members m ON m.id=e.member_id
               WHERE e.created_at LIKE ? AND e.event_type IN
-                    ('Assigned','Reassigned','On Hold','Ready','Resumed','Completed','Ticket Assigned',
+                    ('Upcoming Added','Vehicle Arrived','Assigned','Reassigned','On Hold','Ready',
+                     'Resumed','Completed','Ticket Assigned','Sent for Audit',
                      'Corrected','Assignee Corrected','Assignment Cancelled','Vehicle Cancelled')
               ORDER BY e.created_at, e.id
             """, (month + "%",))
@@ -772,6 +827,52 @@ class Handler(SimpleHTTPRequestHandler):
             safe_notify_teams(queued_vehicle, free_member, "Auto")
         self.send_json({"ok": True, "vin": vehicle["vin"],
                         "autoAssigned": next_assignment[0]["vin"] if next_assignment else None})
+
+    def create_upcoming_vehicle(self, data):
+        vin = str(data.get("vin", "")).strip().upper()
+        program = str(data.get("program", "")).strip()
+        location = str(data.get("location", "")).strip().upper()
+        comments = str(data.get("comments", "")).strip()
+        if not vin or program not in PROGRAMS or location not in ("FREC", "CTC"):
+            return self.send_json({"error": "Enter a VIN and select a valid program and location."}, 400)
+        with DB_LOCK, connect() as db:
+            insert = "INSERT INTO vehicles(vin,program,location,comments,status) VALUES(?,?,?,?, 'Upcoming')"
+            if USE_POSTGRES:
+                insert += " RETURNING id"
+            cursor = execute(db, insert, (vin, program, location, comments))
+            vehicle_id = cursor.fetchone()["id"] if USE_POSTGRES else cursor.lastrowid
+            execute(db, "INSERT INTO events(vehicle_id,event_type,details,created_at) VALUES(?,?,?,?)",
+                    (vehicle_id, "Upcoming Added", "Pre-queue", now_iso()))
+        self.send_json({"ok": True, "id": vehicle_id, "vin": vin}, 201)
+
+    def activate_upcoming_vehicle(self, vehicle_id):
+        assigned_vehicle = assigned_member = None
+        with DB_LOCK, connect() as db:
+            begin_write(db)
+            vehicle = execute(db, "SELECT * FROM vehicles WHERE id=? AND status='Upcoming'", (vehicle_id,)).fetchone()
+            if not vehicle:
+                return self.send_json({"error": "This vehicle is not in the upcoming list."}, 409)
+            stamp = now_iso()
+            execute(db, "UPDATE vehicles SET status='Queued' WHERE id=?", (vehicle_id,))
+            execute(db, "INSERT INTO events(vehicle_id,event_type,details,created_at) VALUES(?,?,?,?)",
+                    (vehicle_id, "Vehicle Arrived", "Moved from upcoming to queue", stamp))
+            lock = " FOR UPDATE SKIP LOCKED" if USE_POSTGRES else ""
+            member = execute(db, """
+              SELECT * FROM members WHERE available_today=1 AND current_load=0
+              AND location=? ORDER BY overall_load,id LIMIT 1
+            """ + lock, (vehicle["location"],)).fetchone()
+            if member:
+                updated = execute(db, "UPDATE vehicles SET status='Assigned',assigned_to=?,assignment_type='Auto',assigned_at=? WHERE id=? AND status='Queued'",
+                                  (member["id"], stamp, vehicle_id)).rowcount
+                if updated == 1:
+                    execute(db, "UPDATE members SET current_load=current_load+1,overall_load=overall_load+1,auto_count=auto_count+1 WHERE id=?", (member["id"],))
+                    execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                            (vehicle_id, "Assigned", member["id"], "Auto from upcoming", stamp))
+                    assigned_vehicle, assigned_member = dict(vehicle), dict(member)
+        sent = safe_notify_teams(assigned_vehicle, assigned_member, "Auto") if assigned_member else False
+        self.send_json({"ok": True, "vin": vehicle["vin"],
+                        "assignedTo": assigned_member["name"] if assigned_member else None,
+                        "teamsSent": sent})
 
     def create_external_work(self, data):
         vin = str(data.get("vin", "")).strip().upper()
@@ -1076,7 +1177,39 @@ class Handler(SimpleHTTPRequestHandler):
                     (vehicle_id, "Ticket Assigned", vehicle["assigned_to"], "Manager recorded ticket assignment", stamp))
         self.send_json({"ok": True, "vin": vehicle["vin"], "ticketAssignedAt": stamp})
 
-    def complete_vehicle(self, vehicle_id):
+    def _notify_audit(self, vehicle_id, spot):
+        with connect() as db:
+            vehicle = execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            if not vehicle or vehicle["status"] != "Completed" or not vehicle["assigned_to"]:
+                return False, "Vehicle must be completed before it can be sent for audit."
+            if vehicle["audit_sent"]:
+                return True, None
+            member = execute(db, "SELECT * FROM members WHERE id=?", (vehicle["assigned_to"],)).fetchone()
+        if not notify_audit_teams(dict(vehicle), dict(member), spot):
+            return False, "Audit Teams did not accept the notification. Check the audit webhook."
+        stamp = now_iso()
+        with DB_LOCK, connect() as db:
+            execute(db, "UPDATE vehicles SET audit_sent=1,audit_spot=?,audit_sent_at=? WHERE id=?",
+                    (spot, stamp, vehicle_id))
+            execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
+                    (vehicle_id, "Sent for Audit", vehicle["assigned_to"], f"Spot {spot}", stamp))
+        return True, None
+
+    def send_vehicle_for_audit(self, vehicle_id, data):
+        spot = str(data.get("spot", "")).strip()
+        if not spot:
+            return self.send_json({"error": "Enter the audit spot number."}, 400)
+        sent, error = Handler._notify_audit(self, vehicle_id, spot)
+        if not sent:
+            return self.send_json({"error": error}, 502)
+        self.send_json({"ok": True, "auditSent": True, "spot": spot})
+
+    def complete_vehicle(self, vehicle_id, data=None):
+        data = data or {}
+        audit_requested = bool(data.get("sendForAudit"))
+        audit_spot = str(data.get("spot", "")).strip()
+        if audit_requested and not audit_spot:
+            return self.send_json({"error": "Enter the audit spot number."}, 400)
         next_assignment = None
         next_kind = None
         completed_vehicle = None
@@ -1100,6 +1233,10 @@ class Handler(SimpleHTTPRequestHandler):
             completed_vehicle = dict(vehicle)
             completed_member = dict(member) if member else {"name": "Unknown"}
         completed_sent = safe_notify_teams(completed_vehicle, completed_member, "Completed")
+        audit_sent = False
+        audit_error = None
+        if audit_requested:
+            audit_sent, audit_error = Handler._notify_audit(self, vehicle_id, audit_spot)
         if next_assignment:
             next_vehicle, free_member = next_assignment
             queue_sent = safe_notify_teams(next_vehicle, free_member, next_kind)
@@ -1107,9 +1244,11 @@ class Handler(SimpleHTTPRequestHandler):
                                    "autoAssigned": next_vehicle["vin"] if next_kind == "Auto" else None,
                                    "resumed": next_vehicle["vin"] if next_kind == "Resumed" else None,
                                    "assignedTo": free_member["name"], "teamsSent": completed_sent,
-                                   "queueTeamsSent": queue_sent})
+                                   "queueTeamsSent": queue_sent, "auditSent": audit_sent,
+                                   "auditError": audit_error})
         self.send_json({"ok": True, "autoAssigned": None, "resumed": None,
-                        "teamsSent": completed_sent})
+                        "teamsSent": completed_sent, "auditSent": audit_sent,
+                        "auditError": audit_error})
 
     def hold_vehicle(self, vehicle_id, data):
         reason = str(data.get("reason", "")).strip()
