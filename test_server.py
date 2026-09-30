@@ -309,6 +309,30 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(member["current_load"], 1)
             self.assertEqual(member["overall_load"], 1)
 
+    def test_upcoming_vehicle_can_be_manually_assigned_on_arrival(self):
+        created = ResponseRecorder()
+        server.Handler.create_upcoming_vehicle(created, {
+            "vin": "UPMANUAL100", "program": "DT ICE", "location": "FREC", "comments": "",
+        })
+        vehicle_id = created.value["id"]
+        arrived = ResponseRecorder()
+
+        server.Handler.activate_upcoming_vehicle(arrived, vehicle_id, {
+            "assignMode": "Manual", "memberId": 2,
+        })
+
+        self.assertEqual(arrived.status, 200)
+        self.assertEqual(arrived.value["assignedTo"], "Elias Saleh")
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            member = server.execute(db, "SELECT * FROM members WHERE id=2").fetchone()
+            self.assertEqual(vehicle["status"], "Assigned")
+            self.assertEqual(vehicle["assigned_to"], 2)
+            self.assertEqual(vehicle["assignment_type"], "Manual")
+            self.assertEqual(member["current_load"], 1)
+            self.assertEqual(member["overall_load"], 1)
+            self.assertEqual(member["manual_count"], 1)
+
     @patch("server.notify_audit_teams", return_value=True)
     def test_complete_can_send_vehicle_to_audit_group(self, notify_audit):
         vehicle_id = self.seed_vehicle("AUDIT100", "Assigned")

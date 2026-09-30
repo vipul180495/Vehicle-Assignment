@@ -593,7 +593,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.assign_ticket(int(path.split("/")[3]))
             if path.startswith("/api/vehicles/") and path.endswith("/arrive"):
                 if not self.require_role("manager"): return
-                return self.activate_upcoming_vehicle(int(path.split("/")[3]))
+                return self.activate_upcoming_vehicle(int(path.split("/")[3]), data)
             if path.startswith("/api/vehicles/") and path.endswith("/send-audit"):
                 if not self.require_role("manager"): return
                 return self.send_vehicle_for_audit(int(path.split("/")[3]), data)
@@ -845,31 +845,45 @@ class Handler(SimpleHTTPRequestHandler):
                     (vehicle_id, "Upcoming Added", "Pre-queue", now_iso()))
         self.send_json({"ok": True, "id": vehicle_id, "vin": vin}, 201)
 
-    def activate_upcoming_vehicle(self, vehicle_id):
+    def activate_upcoming_vehicle(self, vehicle_id, data=None):
+        data = data or {}
+        mode = str(data.get("assignMode", "Auto"))
+        if mode not in ("Auto", "Manual"):
+            return self.send_json({"error": "Choose Auto or Manual assignment."}, 400)
         assigned_vehicle = assigned_member = None
         with DB_LOCK, connect() as db:
             begin_write(db)
             vehicle = execute(db, "SELECT * FROM vehicles WHERE id=? AND status='Upcoming'", (vehicle_id,)).fetchone()
             if not vehicle:
                 return self.send_json({"error": "This vehicle is not in the upcoming list."}, 409)
+            if mode == "Manual":
+                if not data.get("memberId"):
+                    return self.send_json({"error": "Select a teammate for manual assignment."}, 400)
+                lock = " FOR UPDATE" if USE_POSTGRES else ""
+                member = execute(db, "SELECT * FROM members WHERE id=? AND available_today=1 AND current_load=0" + lock,
+                                 (int(data["memberId"]),)).fetchone()
+                if not member:
+                    return self.send_json({"error": "The selected teammate is no longer available. The vehicle remains Upcoming."}, 409)
+            else:
+                lock = " FOR UPDATE SKIP LOCKED" if USE_POSTGRES else ""
+                member = execute(db, """
+                  SELECT * FROM members WHERE available_today=1 AND current_load=0
+                  AND location=? ORDER BY overall_load,id LIMIT 1
+                """ + lock, (vehicle["location"],)).fetchone()
             stamp = now_iso()
             execute(db, "UPDATE vehicles SET status='Queued' WHERE id=?", (vehicle_id,))
             execute(db, "INSERT INTO events(vehicle_id,event_type,details,created_at) VALUES(?,?,?,?)",
-                    (vehicle_id, "Vehicle Arrived", "Moved from upcoming to queue", stamp))
-            lock = " FOR UPDATE SKIP LOCKED" if USE_POSTGRES else ""
-            member = execute(db, """
-              SELECT * FROM members WHERE available_today=1 AND current_load=0
-              AND location=? ORDER BY overall_load,id LIMIT 1
-            """ + lock, (vehicle["location"],)).fetchone()
+                    (vehicle_id, "Vehicle Arrived", f"{mode} assignment selected", stamp))
             if member:
-                updated = execute(db, "UPDATE vehicles SET status='Assigned',assigned_to=?,assignment_type='Auto',assigned_at=? WHERE id=? AND status='Queued'",
-                                  (member["id"], stamp, vehicle_id)).rowcount
+                updated = execute(db, "UPDATE vehicles SET status='Assigned',assigned_to=?,assignment_type=?,assigned_at=? WHERE id=? AND status='Queued'",
+                                  (member["id"], mode, stamp, vehicle_id)).rowcount
                 if updated == 1:
-                    execute(db, "UPDATE members SET current_load=current_load+1,overall_load=overall_load+1,auto_count=auto_count+1 WHERE id=?", (member["id"],))
+                    count_field = "manual_count" if mode == "Manual" else "auto_count"
+                    execute(db, f"UPDATE members SET current_load=current_load+1,overall_load=overall_load+1,{count_field}={count_field}+1 WHERE id=?", (member["id"],))
                     execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
-                            (vehicle_id, "Assigned", member["id"], "Auto from upcoming", stamp))
+                            (vehicle_id, "Assigned", member["id"], f"{mode} from upcoming", stamp))
                     assigned_vehicle, assigned_member = dict(vehicle), dict(member)
-        sent = safe_notify_teams(assigned_vehicle, assigned_member, "Auto") if assigned_member else False
+        sent = safe_notify_teams(assigned_vehicle, assigned_member, mode) if assigned_member else False
         self.send_json({"ok": True, "vin": vehicle["vin"],
                         "assignedTo": assigned_member["name"] if assigned_member else None,
                         "teamsSent": sent})
