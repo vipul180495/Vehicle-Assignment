@@ -718,6 +718,13 @@ class Handler(SimpleHTTPRequestHandler):
                         SUM(CASE WHEN e.event_type='Assigned' AND LOWER(COALESCE(e.details,'')) NOT LIKE 'manual%' AND LOWER(COALESCE(e.details,''))!='external' THEN 1 ELSE 0 END) auto_count,
                         SUM(CASE WHEN e.event_type='Reassigned' OR (e.event_type='Assigned' AND LOWER(COALESCE(e.details,'')) LIKE 'manual%') THEN 1 ELSE 0 END) manual_count
                       FROM members m LEFT JOIN events e ON e.member_id=m.id AND e.created_at LIKE ?
+                        AND e.event_type IN ('Assigned','Reassigned')
+                        AND NOT EXISTS (
+                          SELECT 1 FROM events later
+                          WHERE later.vehicle_id=e.vehicle_id
+                            AND later.event_type IN ('Assigned','Reassigned','Assignee Corrected')
+                            AND (later.created_at>e.created_at OR (later.created_at=e.created_at AND later.id>e.id))
+                        )
                       GROUP BY m.id,m.name ORDER BY m.name
                     """, (month + "%",))
                     source = "history"
@@ -1401,8 +1408,25 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "Vehicle or selected teammate is no longer available."}, 409)
             old_id, stamp = vehicle["assigned_to"], now_iso()
             previous_member = execute(db, "SELECT name FROM members WHERE id=?", (old_id,)).fetchone()
+            assignment_event = execute(db, """
+              SELECT event_type,details,created_at FROM events WHERE vehicle_id=?
+              AND event_type IN ('Assigned','Reassigned','Assignee Corrected') ORDER BY created_at DESC,id DESC LIMIT 1
+            """, (vehicle_id,)).fetchone()
+            archive = execute(db, "SELECT MAX(exported_at) AS cutoff FROM monthly_archives").fetchone()
+            cutoff = archive["cutoff"] if archive else None
             execute(db, "UPDATE vehicles SET previous_assignee=?,assigned_to=?,assignment_type='Manual',assigned_at=?,reassignment_reason=?,ticket_assigned=0,ticket_assigned_at=NULL WHERE id=?",
                        (old_id, new_member_id, stamp, reason, vehicle_id))
+            if assignment_event and (not cutoff or assignment_event["created_at"] > cutoff):
+                assignment_type = str(vehicle["assignment_type"] or "Auto").lower()
+                if assignment_type in ("manual", "reassigned"):
+                    count_field = "manual_count"
+                elif assignment_type == "external":
+                    count_field = None
+                else:
+                    count_field = "auto_count"
+                execute(db, "UPDATE members SET overall_load=CASE WHEN overall_load>0 THEN overall_load-1 ELSE 0 END WHERE id=?", (old_id,))
+                if count_field:
+                    execute(db, f"UPDATE members SET {count_field}=CASE WHEN {count_field}>0 THEN {count_field}-1 ELSE 0 END WHERE id=?", (old_id,))
             execute(db, "UPDATE members SET overall_load=overall_load+1,manual_count=manual_count+1 WHERE id=?", (new_member_id,))
             recalculate_member_load(db, old_id)
             recalculate_member_load(db, new_member_id)
