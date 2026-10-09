@@ -517,6 +517,10 @@ class Handler(SimpleHTTPRequestHandler):
             "/assets/dashboard-background.png",
         ):
             return self.serve_static(path)
+        if path in ("/reports", "/reports.html"):
+            if self.role() != "manager":
+                return self.redirect_login("manager")
+            return self.serve_static("/reports.html")
         if path in ("/manager", "/manager.html"):
             if self.role() != "manager":
                 return self.redirect_login("manager")
