@@ -491,6 +491,10 @@ class Handler(SimpleHTTPRequestHandler):
             if not self.require_role("admin"):
                 return
             return self.export_month_csv()
+        if path == "/api/reports/assignment-load":
+            if not self.require_role("manager"):
+                return
+            return self.report_assignment_load()
         if path == "/api/state":
             if not self.require_role("manager", "team", "admin"):
                 return
@@ -685,6 +689,47 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def report_assignment_load(self):
+        month = self.requested_month()
+        with connect() as db:
+            archived = rows(db, """
+              SELECT m.id,m.name,a.overall_load,a.auto_count,a.manual_count
+              FROM members m LEFT JOIN monthly_archives a
+                ON a.member_id=m.id AND a.period=?
+              ORDER BY m.name
+            """, (month,))
+            has_archive = any(row["overall_load"] is not None for row in archived)
+            if has_archive:
+                report_rows = archived
+                source = "archive"
+            else:
+                current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+                if month == current_month:
+                    report_rows = rows(db, """
+                      SELECT id,name,overall_load,auto_count,manual_count
+                      FROM members ORDER BY name
+                    """)
+                    source = "current"
+                else:
+                    report_rows = rows(db, """
+                      SELECT m.id,m.name,
+                        SUM(CASE WHEN e.event_type IN ('Assigned','Reassigned') THEN 1 ELSE 0 END) overall_load,
+                        SUM(CASE WHEN e.event_type='Assigned' AND LOWER(COALESCE(e.details,'')) NOT LIKE 'manual%' AND LOWER(COALESCE(e.details,''))!='external' THEN 1 ELSE 0 END) auto_count,
+                        SUM(CASE WHEN e.event_type='Reassigned' OR (e.event_type='Assigned' AND LOWER(COALESCE(e.details,'')) LIKE 'manual%') THEN 1 ELSE 0 END) manual_count
+                      FROM members m LEFT JOIN events e ON e.member_id=m.id AND e.created_at LIKE ?
+                      GROUP BY m.id,m.name ORDER BY m.name
+                    """, (month + "%",))
+                    source = "history"
+        result = []
+        for row in report_rows:
+            total = int(row["overall_load"] or 0)
+            auto = int(row["auto_count"] or 0)
+            manual = int(row["manual_count"] or 0)
+            result.append({"id": row["id"], "name": row["name"], "total": total,
+                           "auto": auto, "manual": manual,
+                           "external": max(0, total - auto - manual)})
+        self.send_json({"month": month, "source": source, "members": result})
 
     def vehicle_history(self, vehicle_id):
         with connect() as db:
