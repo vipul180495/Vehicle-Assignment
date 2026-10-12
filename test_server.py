@@ -351,6 +351,42 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(member["location"], "FREC")
             self.assertEqual(member["current_load"], 1)
 
+    def test_ctc_upcoming_vehicle_auto_assigns_from_shared_team_pool(self):
+        created = ResponseRecorder()
+        server.Handler.create_upcoming_vehicle(created, {
+            "vin": "CTC-UPCOMING100", "program": "HDCC", "location": "CTC", "comments": "Pilot",
+        })
+        arrived = ResponseRecorder()
+
+        server.Handler.activate_upcoming_vehicle(arrived, created.value["id"], {"assignMode": "Auto"})
+
+        self.assertEqual(arrived.status, 200)
+        self.assertEqual(arrived.value["assignedTo"], "Dheeraj Adabala")
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (created.value["id"],)).fetchone()
+            self.assertEqual(vehicle["status"], "Assigned")
+            self.assertEqual(vehicle["location"], "CTC")
+            self.assertEqual(vehicle["assigned_to"], 1)
+
+    def test_completion_assigns_oldest_queued_vehicle_across_locations(self):
+        active_id = self.seed_vehicle("FREC-ACTIVE100", "Assigned")
+        queued_id = self.seed_vehicle("CTC-QUEUE100", "Queued", assigned=False)
+        with server.connect() as db:
+            server.execute(db, "UPDATE vehicles SET location='CTC' WHERE id=?", (queued_id,))
+            server.execute(db, "UPDATE members SET current_load=1,overall_load=1,auto_count=1 WHERE id=1")
+        response = ResponseRecorder()
+
+        server.Handler.complete_vehicle(response, active_id)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.value["autoAssigned"], "CTC-QUEUE100")
+        with server.connect() as db:
+            queued = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (queued_id,)).fetchone()
+            member = server.execute(db, "SELECT * FROM members WHERE id=1").fetchone()
+            self.assertEqual(queued["status"], "Assigned")
+            self.assertEqual(queued["assigned_to"], 1)
+            self.assertEqual(member["current_load"], 1)
+
     @patch("server.safe_notify_teams")
     def test_cancelling_upcoming_vehicle_does_not_send_teams_notification(self, notify):
         created = ResponseRecorder()
