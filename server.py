@@ -176,7 +176,7 @@ def recalculate_member_load(db, member_id):
 
 
 def assign_oldest_waiting(db, member_id):
-    """Assign the oldest same-location queue item to a teammate who just became free."""
+    """Assign the oldest queue item to a teammate who just became free."""
     member_lock = " FOR UPDATE" if USE_POSTGRES else ""
     member = execute(
         db,
@@ -188,8 +188,7 @@ def assign_oldest_waiting(db, member_id):
     vehicle_lock = " FOR UPDATE SKIP LOCKED" if USE_POSTGRES else ""
     vehicle = execute(
         db,
-        "SELECT * FROM vehicles WHERE status='Queued' AND location=? ORDER BY id LIMIT 1" + vehicle_lock,
-        (member["location"],),
+        "SELECT * FROM vehicles WHERE status='Queued' ORDER BY id LIMIT 1" + vehicle_lock,
     ).fetchone()
     if not vehicle:
         return None
@@ -924,8 +923,8 @@ class Handler(SimpleHTTPRequestHandler):
                 lock = " FOR UPDATE SKIP LOCKED" if USE_POSTGRES else ""
                 member = execute(db, """
                   SELECT * FROM members WHERE available_today=1 AND current_load=0
-                  AND location=? ORDER BY overall_load,id LIMIT 1
-                """ + lock, (vehicle["location"],)).fetchone()
+                  ORDER BY overall_load,id LIMIT 1
+                """ + lock).fetchone()
             stamp = now_iso()
             execute(db, "UPDATE vehicles SET status='Queued' WHERE id=?", (vehicle_id,))
             execute(db, "INSERT INTO events(vehicle_id,event_type,details,created_at) VALUES(?,?,?,?)",
@@ -1211,8 +1210,8 @@ class Handler(SimpleHTTPRequestHandler):
                 lock = " FOR UPDATE SKIP LOCKED" if USE_POSTGRES else ""
                 member = execute(db, """
                   SELECT * FROM members WHERE available_today=1 AND current_load=0
-                  AND location=? ORDER BY overall_load, id LIMIT 1
-                """ + lock, (vehicle["location"],)).fetchone()
+                  ORDER BY overall_load, id LIMIT 1
+                """ + lock).fetchone()
             if not member:
                 return self.send_json({"error": "No available teammate for this location."}, 409)
             stamp = now_iso()

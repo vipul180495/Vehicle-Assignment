@@ -333,6 +333,24 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(member["overall_load"], 1)
             self.assertEqual(member["manual_count"], 1)
 
+    def test_auto_assignment_uses_available_engineers_across_locations(self):
+        vehicle_id = self.seed_vehicle("CTC-AUTO100", "Queued", assigned=False)
+        with server.connect() as db:
+            server.execute(db, "UPDATE vehicles SET location='CTC' WHERE id=?", (vehicle_id,))
+        response = ResponseRecorder()
+
+        server.Handler.assign_vehicle(response, vehicle_id, {"assignMode": "Auto"})
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.value["assignedTo"], "Dheeraj Adabala")
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            member = server.execute(db, "SELECT * FROM members WHERE id=1").fetchone()
+            self.assertEqual(vehicle["location"], "CTC")
+            self.assertEqual(vehicle["assigned_to"], 1)
+            self.assertEqual(member["location"], "FREC")
+            self.assertEqual(member["current_load"], 1)
+
     @patch("server.safe_notify_teams")
     def test_cancelling_upcoming_vehicle_does_not_send_teams_notification(self, notify):
         created = ResponseRecorder()

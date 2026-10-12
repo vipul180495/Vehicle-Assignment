@@ -38,8 +38,8 @@ For a separate audit group, create a second Teams Workflow webhook and configure
 
 ## Business rules implemented
 
-- Auto assignment chooses an available teammate in the same location with no active vehicle and the lowest overall assignment count.
-- If nobody is available, the vehicle remains queued. The oldest same-location queued vehicle is automatically assigned when a teammate completes a vehicle or becomes available.
+- Auto assignment uses one shared team pool for every vehicle location. It chooses an available teammate with no active vehicle and the lowest overall assignment count.
+- If nobody is available, the vehicle remains queued. The oldest queued vehicle, regardless of location, is automatically assigned when a teammate completes a vehicle or becomes available.
 - Managers can add expected vehicles to Upcoming Vehicles without assigning them. Clicking Vehicle arrived offers balanced Auto assignment or Manual assignment to a selected available teammate; Auto leaves the vehicle in the live queue when nobody is free.
 - Manual assignment uses the manager's selected available teammate.
 - Managers can record work received outside the app as External, either in progress or already completed, with an optional Teams notification. It counts toward Total Assignments without changing the teammate's home location.
