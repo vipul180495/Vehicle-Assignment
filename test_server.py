@@ -321,6 +321,27 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (response.value["id"],)).fetchone()
             self.assertEqual(vehicle["program"], "DT ICE FFB")
 
+    def test_same_day_duplicate_warns_and_can_be_added_anyway(self):
+        first = ResponseRecorder()
+        payload = {
+            "vin": "SAME-DAY100", "program": "DT ICE", "location": "FREC", "comments": "",
+        }
+        server.Handler.create_upcoming_vehicle(first, payload)
+        warning = ResponseRecorder()
+
+        server.Handler.create_upcoming_vehicle(warning, payload)
+
+        self.assertEqual(warning.status, 409)
+        self.assertTrue(warning.value["possibleDuplicate"])
+        self.assertEqual(len(warning.value["existing"]), 1)
+
+        allowed = ResponseRecorder()
+        server.Handler.create_upcoming_vehicle(allowed, {**payload, "allowDuplicate": True})
+        self.assertEqual(allowed.status, 201)
+        with server.connect() as db:
+            total = server.execute(db, "SELECT COUNT(*) total FROM vehicles WHERE vin='SAME-DAY100'").fetchone()["total"]
+            self.assertEqual(total, 2)
+
     def test_upcoming_vehicle_can_be_manually_assigned_on_arrival(self):
         created = ResponseRecorder()
         server.Handler.create_upcoming_vehicle(created, {

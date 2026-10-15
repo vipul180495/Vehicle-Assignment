@@ -15,6 +15,7 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from http.cookies import SimpleCookie
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).resolve().parent
@@ -23,6 +24,7 @@ USE_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 DB_PATH = Path(os.getenv("DATABASE_PATH", str(ROOT / "vehicle_assignments.db")))
 DB_LOCK = threading.Lock()
 PORT = int(os.getenv("PORT", "8080"))
+APP_TIMEZONE = ZoneInfo("America/New_York")
 COOKIE_SECRET = os.getenv("COOKIE_SECRET", "").strip() or secrets.token_hex(32)
 MANAGER_PASSWORD = os.getenv("MANAGER_PASSWORD", "").strip()
 TEAM_PASSWORD = os.getenv("TEAM_PASSWORD", "").strip()
@@ -259,6 +261,29 @@ def rows(db, sql, args=()):
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def same_day_vehicle_matches(db, vin, program, location, day):
+    candidates = rows(db, """
+      SELECT v.id,v.vin,v.program,v.location,v.status,v.assigned_at,m.name assigned_name,
+             COALESCE(v.assigned_at,(SELECT MIN(e.created_at) FROM events e WHERE e.vehicle_id=v.id)) activity_at
+      FROM vehicles v LEFT JOIN members m ON m.id=v.assigned_to
+      WHERE UPPER(v.vin)=? AND v.program=? AND UPPER(v.location)=?
+    """, (vin.upper(), program, location.upper()))
+    matches = []
+    for candidate in candidates:
+        stamp = candidate.get("activity_at")
+        if not stamp:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if parsed.astimezone(APP_TIMEZONE).date().isoformat() == day:
+                matches.append(candidate)
+        except ValueError:
+            continue
+    return matches
 
 
 def notify_teams(vehicle, member, assignment_type):
@@ -658,6 +683,24 @@ class Handler(SimpleHTTPRequestHandler):
             raise ValueError("Month must use YYYY-MM format.")
         return value
 
+    def reject_same_day_duplicate(self, db, data, vin, program, location, entry_day=None):
+        if data.get("allowDuplicate"):
+            return False
+        day = str(entry_day or data.get("entryDate") or datetime.now(APP_TIMEZONE).date().isoformat())
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            day = datetime.now(APP_TIMEZONE).date().isoformat()
+        matches = same_day_vehicle_matches(db, vin, program, location, day)
+        if not matches:
+            return False
+        self.send_json({
+            "error": f"VIN {vin} already has a {program} entry at {location} on {day}.",
+            "possibleDuplicate": True,
+            "existing": [{"id": row["id"], "status": row["status"],
+                          "engineer": row.get("assigned_name"), "assignedAt": row.get("assigned_at")}
+                         for row in matches],
+        }, 409)
+        return True
+
     def export_month_csv(self):
         month = self.requested_month()
         with connect() as db:
@@ -891,6 +934,8 @@ class Handler(SimpleHTTPRequestHandler):
         if not vin or program not in PROGRAMS or location not in ("FREC", "CTC"):
             return self.send_json({"error": "Enter a VIN and select a valid program and location."}, 400)
         with DB_LOCK, connect() as db:
+            if Handler.reject_same_day_duplicate(self, db, data, vin, program, location):
+                return
             insert = "INSERT INTO vehicles(vin,program,location,comments,status) VALUES(?,?,?,?, 'Upcoming')"
             if USE_POSTGRES:
                 insert += " RETURNING id"
@@ -963,6 +1008,8 @@ class Handler(SimpleHTTPRequestHandler):
         completed_at = (completed_date or assigned_date) + "T12:00:00+00:00" if work_status == "Completed" and (completed_date or assigned_date) else (now_iso() if work_status == "Completed" else None)
         with DB_LOCK, connect() as db:
             begin_write(db)
+            if Handler.reject_same_day_duplicate(self, db, data, vin, program, location, assigned_date or None):
+                return
             member = execute(db, "SELECT * FROM members WHERE id=?", (member_id,)).fetchone()
             if not member:
                 return self.send_json({"error": "Select a valid teammate."}, 400)
@@ -1001,6 +1048,8 @@ class Handler(SimpleHTTPRequestHandler):
         if program not in PROGRAMS:
             return self.send_json({"error": "Select a valid vehicle program."}, 400)
         with DB_LOCK, connect() as db:
+            if Handler.reject_same_day_duplicate(self, db, data, vin, program, location):
+                return
             insert = "INSERT INTO vehicles(vin,program,location,comments) VALUES(?,?,?,?)"
             if USE_POSTGRES:
                 insert += " RETURNING id"
