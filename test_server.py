@@ -309,6 +309,18 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(member["current_load"], 1)
             self.assertEqual(member["overall_load"], 1)
 
+    def test_dt_ice_ffb_program_is_accepted(self):
+        response = ResponseRecorder()
+
+        server.Handler.create_upcoming_vehicle(response, {
+            "vin": "ICEFFB100", "program": "DT ICE FFB", "location": "FREC", "comments": "",
+        })
+
+        self.assertEqual(response.status, 201)
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (response.value["id"],)).fetchone()
+            self.assertEqual(vehicle["program"], "DT ICE FFB")
+
     def test_upcoming_vehicle_can_be_manually_assigned_on_arrival(self):
         created = ResponseRecorder()
         server.Handler.create_upcoming_vehicle(created, {

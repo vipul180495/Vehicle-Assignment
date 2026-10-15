@@ -29,7 +29,7 @@ TEAM_PASSWORD = os.getenv("TEAM_PASSWORD", "").strip()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 PROGRAMS = {
     "DT REEV SFFB", "WS REEV SFFB", "DT REEV", "WS REEV",
-    "DT ICE", "DT TRX", "DT F16", "HDCC",
+    "DT ICE", "DT ICE FFB", "DT TRX", "DT F16", "HDCC",
 }
 
 SEED_MEMBERS = [
