@@ -457,7 +457,47 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(vehicle["status"], "Completed")
             self.assertEqual(vehicle["audit_sent"], 1)
             self.assertEqual(vehicle["audit_spot"], "12")
+            self.assertEqual(vehicle["completion_notice_status"], "Sent")
+            self.assertEqual(vehicle["completion_notice_target"], "Audit")
             self.assertIsNotNone(event)
+
+    @patch("server.safe_notify_teams", return_value=False)
+    def test_failed_completion_notification_is_recorded_for_admin_retry(self, notify):
+        vehicle_id = self.seed_vehicle("NOTICEFAIL100", "Assigned")
+        with server.connect() as db:
+            server.execute(db, "UPDATE members SET current_load=1 WHERE id=1")
+        response = ResponseRecorder()
+
+        server.Handler.complete_vehicle(response, vehicle_id)
+
+        self.assertEqual(response.status, 200)
+        self.assertFalse(response.value["teamsSent"])
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            self.assertEqual(vehicle["completion_notice_status"], "Failed")
+            self.assertEqual(vehicle["completion_notice_target"], "Main")
+            self.assertIn("did not accept", vehicle["completion_notice_error"])
+
+    @patch("server.safe_notify_teams", return_value=True)
+    def test_admin_can_retry_failed_completion_notification(self, notify):
+        vehicle_id = self.seed_vehicle("NOTICERETRY100", "Completed")
+        with server.connect() as db:
+            server.execute(db, """
+              UPDATE vehicles SET completion_notice_status='Failed',
+                completion_notice_target='Main',completion_notice_error='Temporary failure'
+              WHERE id=?
+            """, (vehicle_id,))
+        response = ResponseRecorder()
+
+        server.Handler.retry_completion_notification(response, vehicle_id)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.value["target"], "Main")
+        notify.assert_called_once()
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            self.assertEqual(vehicle["completion_notice_status"], "Sent")
+            self.assertIsNone(vehicle["completion_notice_error"])
 
 
 if __name__ == "__main__":

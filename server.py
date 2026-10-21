@@ -86,6 +86,8 @@ def init_db():
           hold_reason TEXT, held_at TEXT, cancellation_reason TEXT, cancelled_at TEXT,
           ticket_assigned INTEGER NOT NULL DEFAULT 0, ticket_assigned_at TEXT,
           audit_sent INTEGER NOT NULL DEFAULT 0, audit_spot TEXT, audit_sent_at TEXT,
+          completion_notice_status TEXT, completion_notice_target TEXT,
+          completion_notice_error TEXT,
           FOREIGN KEY(assigned_to) REFERENCES members(id),
           FOREIGN KEY(previous_assignee) REFERENCES members(id)
         );
@@ -123,6 +125,9 @@ def init_db():
             db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS audit_sent INTEGER NOT NULL DEFAULT 0")
             db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS audit_spot TEXT")
             db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS audit_sent_at TEXT")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS completion_notice_status TEXT")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS completion_notice_target TEXT")
+            db.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS completion_notice_error TEXT")
             for member in SEED_MEMBERS:
                 db.execute(
                     "INSERT INTO members(id,name,location) VALUES(%s,%s,%s) ON CONFLICT (id) DO NOTHING",
@@ -149,6 +154,12 @@ def init_db():
                 db.execute("ALTER TABLE vehicles ADD COLUMN audit_spot TEXT")
             if "audit_sent_at" not in vehicle_columns:
                 db.execute("ALTER TABLE vehicles ADD COLUMN audit_sent_at TEXT")
+            if "completion_notice_status" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN completion_notice_status TEXT")
+            if "completion_notice_target" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN completion_notice_target TEXT")
+            if "completion_notice_error" not in vehicle_columns:
+                db.execute("ALTER TABLE vehicles ADD COLUMN completion_notice_error TEXT")
             db.executemany(
                 "INSERT OR IGNORE INTO members(id,name,location) VALUES(?,?,?)", SEED_MEMBERS
             )
@@ -596,6 +607,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/admin/vehicles/") and path.endswith("/notify"):
                 if not self.require_role("admin"): return
                 return self.resend_assignment_notification(int(path.split("/")[4]))
+            if path.startswith("/api/admin/vehicles/") and path.endswith("/retry-completion"):
+                if not self.require_role("admin"): return
+                return self.retry_completion_notification(int(path.split("/")[4]))
             if path.startswith("/api/admin/vehicles/") and path.endswith("/delete"):
                 if not self.require_role("admin"): return
                 return self.delete_duplicate_vehicle(int(path.split("/")[4]))
@@ -862,6 +876,34 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"error": "Teams did not accept the notification. Check the webhook and Render logs."}, 502)
         self.send_json({"ok": True, "vin": vehicle_data["vin"],
                         "assignedTo": vehicle_data["assigned_name"]})
+
+    def retry_completion_notification(self, vehicle_id):
+        with connect() as db:
+            vehicle = execute(db, """
+              SELECT v.*, m.name assigned_name
+              FROM vehicles v LEFT JOIN members m ON m.id=v.assigned_to
+              WHERE v.id=? AND v.status='Completed' AND v.completion_notice_status='Failed'
+            """, (vehicle_id,)).fetchone()
+        if not vehicle:
+            return self.send_json({"error": "No failed completion notification was found."}, 409)
+        vehicle_data = dict(vehicle)
+        target = vehicle_data.get("completion_notice_target") or "Main"
+        error = None
+        if target == "Audit":
+            sent, error = Handler._notify_audit(self, vehicle_id, vehicle_data.get("audit_spot") or "")
+        else:
+            sent = safe_notify_teams(
+                vehicle_data, {"name": vehicle_data.get("assigned_name") or "Unknown"}, "Completed"
+            )
+            if not sent:
+                error = "Teams did not accept the completion notification."
+        with DB_LOCK, connect() as db:
+            execute(db, """
+              UPDATE vehicles SET completion_notice_status=?,completion_notice_error=? WHERE id=?
+            """, ("Sent" if sent else "Failed", None if sent else error, vehicle_id))
+        if not sent:
+            return self.send_json({"error": error or "Teams notification failed."}, 502)
+        self.send_json({"ok": True, "vin": vehicle_data["vin"], "target": target})
 
     def delete_duplicate_vehicle(self, vehicle_id):
         """Remove one mistaken duplicate and undo its current-period counters."""
@@ -1340,7 +1382,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "Vehicle is not currently assigned."}, 409)
             member = execute(db, "SELECT * FROM members WHERE id=?", (vehicle["assigned_to"],)).fetchone()
             stamp = now_iso()
-            execute(db, "UPDATE vehicles SET status='Completed',completed_at=? WHERE id=?", (stamp, vehicle_id))
+            execute(db, """
+              UPDATE vehicles SET status='Completed',completed_at=?,audit_spot=? WHERE id=?
+            """, (stamp, audit_spot if audit_requested else vehicle["audit_spot"], vehicle_id))
             recalculate_member_load(db, vehicle["assigned_to"])
             execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,created_at) VALUES(?,?,?,?)",
                        (vehicle_id, "Completed", vehicle["assigned_to"], stamp))
@@ -1357,6 +1401,17 @@ class Handler(SimpleHTTPRequestHandler):
         audit_error = None
         if audit_requested:
             audit_sent, audit_error = Handler._notify_audit(self, vehicle_id, audit_spot)
+        notice_sent = audit_sent if audit_requested else completed_sent
+        notice_target = "Audit" if audit_requested else "Main"
+        notice_error = audit_error if audit_requested else (
+            None if completed_sent else "Teams did not accept the completion notification."
+        )
+        with DB_LOCK, connect() as db:
+            execute(db, """
+              UPDATE vehicles
+              SET completion_notice_status=?,completion_notice_target=?,completion_notice_error=?
+              WHERE id=?
+            """, ("Sent" if notice_sent else "Failed", notice_target, notice_error, vehicle_id))
         if next_assignment:
             next_vehicle, free_member = next_assignment
             queue_sent = safe_notify_teams(next_vehicle, free_member, next_kind)
