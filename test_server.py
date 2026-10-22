@@ -532,6 +532,34 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
         self.assertEqual(response.value["target"], "Audit")
         notify_audit.assert_called_once()
 
+    @patch("server.notify_audit_teams", return_value=True)
+    def test_admin_can_choose_audit_when_resending_main_completion(self, notify_audit):
+        vehicle_id = self.seed_vehicle("AUDITCHOICE100", "Completed")
+        with server.connect() as db:
+            server.execute(db, """
+              UPDATE vehicles SET completion_notice_status='Sent',completion_notice_target='Main'
+              WHERE id=?
+            """, (vehicle_id,))
+        response = ResponseRecorder()
+
+        server.Handler.resend_completion_notification(
+            response, vehicle_id, {"target": "Audit", "spot": "27"}
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.value["target"], "Audit")
+        notify_audit.assert_called_once()
+        with server.connect() as db:
+            vehicle = server.execute(db, "SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+            event = server.execute(
+                db, "SELECT * FROM events WHERE vehicle_id=? AND event_type='Sent for Audit'",
+                (vehicle_id,),
+            ).fetchone()
+            self.assertEqual(vehicle["completion_notice_target"], "Audit")
+            self.assertEqual(vehicle["audit_spot"], "27")
+            self.assertEqual(vehicle["audit_sent"], 1)
+            self.assertIsNotNone(event)
+
 
 if __name__ == "__main__":
     unittest.main()

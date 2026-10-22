@@ -612,7 +612,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.retry_completion_notification(int(path.split("/")[4]))
             if path.startswith("/api/admin/vehicles/") and path.endswith("/resend-completion"):
                 if not self.require_role("admin"): return
-                return self.resend_completion_notification(int(path.split("/")[4]))
+                return self.resend_completion_notification(int(path.split("/")[4]), data)
             if path.startswith("/api/admin/vehicles/") and path.endswith("/delete"):
                 if not self.require_role("admin"): return
                 return self.delete_duplicate_vehicle(int(path.split("/")[4]))
@@ -880,7 +880,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"ok": True, "vin": vehicle_data["vin"],
                         "assignedTo": vehicle_data["assigned_name"]})
 
-    def _send_completion_notification(self, vehicle_id, failed_only=False):
+    def _send_completion_notification(self, vehicle_id, failed_only=False,
+                                      target_override=None, audit_spot_override=None):
         with connect() as db:
             vehicle = execute(db, """
               SELECT v.*, m.name assigned_name
@@ -892,10 +893,10 @@ class Handler(SimpleHTTPRequestHandler):
         if failed_only and vehicle["completion_notice_status"] != "Failed":
             return self.send_json({"error": "No failed completion notification was found."}, 409)
         vehicle_data = dict(vehicle)
-        target = vehicle_data.get("completion_notice_target") or "Main"
+        target = target_override or vehicle_data.get("completion_notice_target") or "Main"
         error = None
         if target == "Audit":
-            spot = vehicle_data.get("audit_spot") or ""
+            spot = str(audit_spot_override or vehicle_data.get("audit_spot") or "").strip()
             if not spot:
                 sent, error = False, "The audit spot number is missing."
             else:
@@ -912,8 +913,21 @@ class Handler(SimpleHTTPRequestHandler):
                 error = "Teams did not accept the completion notification."
         with DB_LOCK, connect() as db:
             execute(db, """
-              UPDATE vehicles SET completion_notice_status=?,completion_notice_error=? WHERE id=?
-            """, ("Sent" if sent else "Failed", None if sent else error, vehicle_id))
+              UPDATE vehicles SET completion_notice_status=?,completion_notice_target=?,
+                completion_notice_error=?,audit_spot=CASE WHEN ?='Audit' THEN ? ELSE audit_spot END
+              WHERE id=?
+            """, ("Sent" if sent else "Failed", target, None if sent else error,
+                  target, spot if target == "Audit" else None, vehicle_id))
+            if sent and target == "Audit":
+                stamp = now_iso()
+                execute(db, "UPDATE vehicles SET audit_sent=1,audit_sent_at=? WHERE id=?",
+                        (stamp, vehicle_id))
+                if not vehicle_data.get("audit_sent"):
+                    execute(db, """
+                      INSERT INTO events(vehicle_id,event_type,member_id,details,created_at)
+                      VALUES(?,?,?,?,?)
+                    """, (vehicle_id, "Sent for Audit", vehicle_data.get("assigned_to"),
+                          f"Spot {spot}", stamp))
         if not sent:
             return self.send_json({"error": error or "Teams notification failed."}, 502)
         self.send_json({"ok": True, "vin": vehicle_data["vin"], "target": target})
@@ -921,8 +935,15 @@ class Handler(SimpleHTTPRequestHandler):
     def retry_completion_notification(self, vehicle_id):
         return Handler._send_completion_notification(self, vehicle_id, failed_only=True)
 
-    def resend_completion_notification(self, vehicle_id):
-        return Handler._send_completion_notification(self, vehicle_id)
+    def resend_completion_notification(self, vehicle_id, data=None):
+        data = data or {}
+        requested_target = str(data.get("target", "")).strip().title() or None
+        if requested_target not in (None, "Main", "Audit"):
+            return self.send_json({"error": "Choose the main or audit notification."}, 400)
+        return Handler._send_completion_notification(
+            self, vehicle_id, target_override=requested_target,
+            audit_spot_override=data.get("spot"),
+        )
 
     def delete_duplicate_vehicle(self, vehicle_id):
         """Remove one mistaken duplicate and undo its current-period counters."""
