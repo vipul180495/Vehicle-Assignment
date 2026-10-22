@@ -499,6 +499,39 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(vehicle["completion_notice_status"], "Sent")
             self.assertIsNone(vehicle["completion_notice_error"])
 
+    @patch("server.safe_notify_teams", return_value=True)
+    def test_admin_can_resend_successful_recent_completion(self, notify):
+        vehicle_id = self.seed_vehicle("NOTICERESEND100", "Completed")
+        with server.connect() as db:
+            server.execute(db, """
+              UPDATE vehicles SET completion_notice_status='Sent',completion_notice_target='Main'
+              WHERE id=?
+            """, (vehicle_id,))
+        response = ResponseRecorder()
+
+        server.Handler.resend_completion_notification(response, vehicle_id)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.value["target"], "Main")
+        notify.assert_called_once()
+
+    @patch("server.notify_audit_teams", return_value=True)
+    def test_admin_resends_audit_completion_to_audit_group(self, notify_audit):
+        vehicle_id = self.seed_vehicle("AUDITRESEND100", "Completed")
+        with server.connect() as db:
+            server.execute(db, """
+              UPDATE vehicles SET completion_notice_status='Sent',
+                completion_notice_target='Audit',audit_spot='18'
+              WHERE id=?
+            """, (vehicle_id,))
+        response = ResponseRecorder()
+
+        server.Handler.resend_completion_notification(response, vehicle_id)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.value["target"], "Audit")
+        notify_audit.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

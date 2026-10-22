@@ -610,6 +610,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/admin/vehicles/") and path.endswith("/retry-completion"):
                 if not self.require_role("admin"): return
                 return self.retry_completion_notification(int(path.split("/")[4]))
+            if path.startswith("/api/admin/vehicles/") and path.endswith("/resend-completion"):
+                if not self.require_role("admin"): return
+                return self.resend_completion_notification(int(path.split("/")[4]))
             if path.startswith("/api/admin/vehicles/") and path.endswith("/delete"):
                 if not self.require_role("admin"): return
                 return self.delete_duplicate_vehicle(int(path.split("/")[4]))
@@ -877,20 +880,30 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"ok": True, "vin": vehicle_data["vin"],
                         "assignedTo": vehicle_data["assigned_name"]})
 
-    def retry_completion_notification(self, vehicle_id):
+    def _send_completion_notification(self, vehicle_id, failed_only=False):
         with connect() as db:
             vehicle = execute(db, """
               SELECT v.*, m.name assigned_name
               FROM vehicles v LEFT JOIN members m ON m.id=v.assigned_to
-              WHERE v.id=? AND v.status='Completed' AND v.completion_notice_status='Failed'
+              WHERE v.id=? AND v.status='Completed'
             """, (vehicle_id,)).fetchone()
         if not vehicle:
+            return self.send_json({"error": "Completed vehicle not found."}, 404)
+        if failed_only and vehicle["completion_notice_status"] != "Failed":
             return self.send_json({"error": "No failed completion notification was found."}, 409)
         vehicle_data = dict(vehicle)
         target = vehicle_data.get("completion_notice_target") or "Main"
         error = None
         if target == "Audit":
-            sent, error = Handler._notify_audit(self, vehicle_id, vehicle_data.get("audit_spot") or "")
+            spot = vehicle_data.get("audit_spot") or ""
+            if not spot:
+                sent, error = False, "The audit spot number is missing."
+            else:
+                sent = notify_audit_teams(
+                    vehicle_data, {"name": vehicle_data.get("assigned_name") or "Unknown"}, spot
+                )
+                if not sent:
+                    error = "Audit Teams did not accept the notification. Check the audit webhook."
         else:
             sent = safe_notify_teams(
                 vehicle_data, {"name": vehicle_data.get("assigned_name") or "Unknown"}, "Completed"
@@ -904,6 +917,12 @@ class Handler(SimpleHTTPRequestHandler):
         if not sent:
             return self.send_json({"error": error or "Teams notification failed."}, 502)
         self.send_json({"ok": True, "vin": vehicle_data["vin"], "target": target})
+
+    def retry_completion_notification(self, vehicle_id):
+        return Handler._send_completion_notification(self, vehicle_id, failed_only=True)
+
+    def resend_completion_notification(self, vehicle_id):
+        return Handler._send_completion_notification(self, vehicle_id)
 
     def delete_duplicate_vehicle(self, vehicle_id):
         """Remove one mistaken duplicate and undo its current-period counters."""
