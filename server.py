@@ -417,7 +417,8 @@ def notify_teams(vehicle, member, assignment_type):
             "weight": "Bolder",
             "color": "Accent",
         })
-    body.append({"type": "FactSet", "facts": facts})
+    else:
+        body.append({"type": "FactSet", "facts": facts})
     payload = {
         "type": "message",
         "attachments": [{

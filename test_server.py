@@ -1,6 +1,7 @@
 import gc
+import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 import server
@@ -298,6 +299,24 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
         self.assertEqual(assignment_type, "Ticket Assigned")
         self.assertEqual(vehicle_arg["vin"], "TICKET200")
         self.assertEqual(member_arg["name"], "Dheeraj Adabala")
+
+    @patch("server.urllib.request.urlopen")
+    def test_ticket_assignment_notification_omits_fact_details(self, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.__enter__.return_value.status = 200
+        mock_urlopen.return_value = mock_response
+
+        with patch.dict(server.os.environ, {"TEAMS_WEBHOOK_URL": "https://example.test/webhook"}):
+            result = server.notify_teams({"vin": "TICKET300", "program": "WS REEV", "location": "FREC", "status": "Completed"},
+                                        {"name": "Vipul Prajapati"}, "Ticket Assigned")
+
+        self.assertTrue(result)
+        request = mock_urlopen.call_args[0][0]
+        payload = json.loads(request.data.decode())
+        body = payload["attachments"][0]["content"]["body"]
+        self.assertEqual([item["type"] for item in body], ["TextBlock", "TextBlock"])
+        self.assertIn("@ Vipul Prajapati you got assigned ticket for VIN TICKET300", body[1]["text"])
+        self.assertNotIn("FactSet", [item["type"] for item in body])
 
     def test_upcoming_vehicle_waits_until_arrival_then_auto_assigns(self):
         created = ResponseRecorder()
