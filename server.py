@@ -311,6 +311,7 @@ def notify_teams(vehicle, member, assignment_type):
     corrected = assignment_type == "Corrected"
     assignee_corrected = assignment_type == "Assignee Corrected"
     external = assignment_type == "External"
+    ticket_assigned = assignment_type == "Ticket Assigned"
     if external:
         notification_title = "External Work Recorded"
         facts = [
@@ -320,6 +321,15 @@ def notify_teams(vehicle, member, assignment_type):
             {"title": "Location", "value": vehicle["location"]},
             {"title": "Status", "value": vehicle.get("status") or "Assigned"},
             {"title": "Comments", "value": vehicle.get("comments") or "—"},
+        ]
+    elif ticket_assigned:
+        notification_title = "Ticket Assigned"
+        facts = [
+            {"title": "VIN", "value": vehicle["vin"]},
+            {"title": "Engineer", "value": member["name"]},
+            {"title": "Program", "value": vehicle["program"]},
+            {"title": "Location", "value": vehicle["location"]},
+            {"title": "Status", "value": vehicle.get("status") or "Assigned"},
         ]
     elif corrected or assignee_corrected:
         notification_title = "Assignment Corrected" if assignee_corrected else "Vehicle Details Corrected"
@@ -395,6 +405,19 @@ def notify_teams(vehicle, member, assignment_type):
             {"title": "Location", "value": vehicle["location"]},
             {"title": "Comments", "value": vehicle.get("comments") or "—"},
         ]
+    body = [
+        {"type": "TextBlock", "text": notification_title, "weight": "Bolder", "size": "Medium"},
+    ]
+    if ticket_assigned:
+        assignee_name = str(member.get("name") or "Engineer").strip()
+        body.append({
+            "type": "TextBlock",
+            "text": f"@ {assignee_name} you got assigned ticket for VIN {vehicle['vin']}",
+            "wrap": True,
+            "weight": "Bolder",
+            "color": "Accent",
+        })
+    body.append({"type": "FactSet", "facts": facts})
     payload = {
         "type": "message",
         "attachments": [{
@@ -403,10 +426,7 @@ def notify_teams(vehicle, member, assignment_type):
             "content": {
                 "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                 "type": "AdaptiveCard", "version": "1.4",
-                "body": [
-                    {"type": "TextBlock", "text": notification_title, "weight": "Bolder", "size": "Medium"},
-                    {"type": "FactSet", "facts": facts}
-                ]
+                "body": body,
             }
         }]
     }
@@ -1376,7 +1396,12 @@ class Handler(SimpleHTTPRequestHandler):
                     (stamp, vehicle_id))
             execute(db, "INSERT INTO events(vehicle_id,event_type,member_id,details,created_at) VALUES(?,?,?,?,?)",
                     (vehicle_id, "Ticket Assigned", vehicle["assigned_to"], "Manager recorded ticket assignment", stamp))
-        self.send_json({"ok": True, "vin": vehicle["vin"], "ticketAssignedAt": stamp})
+            member = execute(db, "SELECT * FROM members WHERE id=?", (vehicle["assigned_to"],)).fetchone()
+            vehicle_data = dict(vehicle)
+            member_data = dict(member) if member else {"name": "Unknown"}
+        notification_sent = safe_notify_teams(vehicle_data, member_data, "Ticket Assigned")
+        self.send_json({"ok": True, "vin": vehicle["vin"], "ticketAssignedAt": stamp,
+                        "teamsSent": notification_sent})
 
     def _notify_audit(self, vehicle_id, spot):
         with connect() as db:

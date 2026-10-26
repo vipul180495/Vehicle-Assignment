@@ -285,6 +285,20 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
             self.assertEqual(member["auto_count"], 2)
             self.assertEqual(member["manual_count"], 1)
 
+    @patch("server.safe_notify_teams", return_value=True)
+    def test_ticket_assignment_sends_notification_to_assigned_engineer(self, mock_notify):
+        vehicle_id = self.seed_vehicle("TICKET200", "Assigned")
+        response = ResponseRecorder()
+
+        server.Handler.assign_ticket(response, vehicle_id)
+
+        self.assertEqual(response.status, 200)
+        mock_notify.assert_called_once()
+        vehicle_arg, member_arg, assignment_type = mock_notify.call_args[0]
+        self.assertEqual(assignment_type, "Ticket Assigned")
+        self.assertEqual(vehicle_arg["vin"], "TICKET200")
+        self.assertEqual(member_arg["name"], "Dheeraj Adabala")
+
     def test_upcoming_vehicle_waits_until_arrival_then_auto_assigns(self):
         created = ResponseRecorder()
         server.Handler.create_upcoming_vehicle(created, {
