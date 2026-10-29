@@ -410,12 +410,23 @@ def notify_teams(vehicle, member, assignment_type):
     ]
     if ticket_assigned:
         assignee_name = str(member.get("name") or "Engineer").strip()
+        mention_text = f"<at>{assignee_name}</at>"
         body.append({
             "type": "TextBlock",
-            "text": f"@ {assignee_name} you got assigned ticket for VIN {vehicle['vin']}",
+            "text": f"{mention_text} you got assigned ticket for VIN {vehicle['vin']}",
             "wrap": True,
             "weight": "Bolder",
             "color": "Accent",
+            "msteams": {
+                "entities": [{
+                    "type": "mention",
+                    "text": mention_text,
+                    "mentioned": {
+                        "id": str(member.get("id") or assignee_name),
+                        "name": assignee_name,
+                    },
+                }]
+            },
         })
     else:
         body.append({"type": "FactSet", "facts": facts})

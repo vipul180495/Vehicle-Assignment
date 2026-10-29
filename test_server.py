@@ -315,7 +315,9 @@ class DeleteDuplicateVehicleTests(unittest.TestCase):
         payload = json.loads(request.data.decode())
         body = payload["attachments"][0]["content"]["body"]
         self.assertEqual([item["type"] for item in body], ["TextBlock", "TextBlock"])
-        self.assertIn("@ Vipul Prajapati you got assigned ticket for VIN TICKET300", body[1]["text"])
+        self.assertIn("<at>Vipul Prajapati</at> you got assigned ticket for VIN TICKET300", body[1]["text"])
+        self.assertEqual(body[1]["color"], "Accent")
+        self.assertIn("mention", json.dumps(body[1].get("msteams", {}), default=str))
         self.assertNotIn("FactSet", [item["type"] for item in body])
 
     def test_upcoming_vehicle_waits_until_arrival_then_auto_assigns(self):
