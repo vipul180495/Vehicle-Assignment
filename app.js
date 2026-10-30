@@ -17,19 +17,8 @@ async function submitAdminCompletionNotification(target){const id=$('#adminResen
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const initials=n=>n.split(' ').map(x=>x[0]).slice(0,2).join('');
-function memberColorClass(name){const normalized=String(name||'').trim();const map={
-  'Dheeraj Adabala':'member-tone-blue',
-  'Elias Saleh':'member-tone-amber',
-  'Farhan Naeem':'member-tone-cyan',
-  'Joseph Girimonte':'member-tone-green',
-  'Monisha Lanka':'member-tone-pink',
-  'Narendra Reddy':'member-tone-blue',
-  'Rishika Kumar':'member-tone-purple',
-  'Sameer Mohammed':'member-tone-teal',
-  'Syed Ahmed':'member-tone-indigo',
-  'Vipul Prajapati':'member-tone-violet',
-};const key=normalized.replace(/\s+/g,' ').trim();return map[key]||'member-tone-slate'}
-function memberNameHtml(name){const safe=String(name||'—');const tone=memberColorClass(safe==='—'?'':safe);return `<span class="member-name ${tone}">${esc(safe)}</span>`}
+function memberColorClass(name){return 'member-tone-slate'}
+function memberNameHtml(name){const safe=String(name||'—');return `<span class="member-name member-tone-slate">${esc(safe)}</span>`}
 const fmt=d=>d?new Date(d).toLocaleString():'—';
 const shortDate=d=>d?new Date(d).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'}):'—';
 const mobileActionLabels={'Vehicle arrived':'Arrived','Return to queue':'Queue','Cancel vehicle':'Cancel','Ticket assigned':'Ticket ✓','Assign ticket':'Ticket','View history':'History','Resend notification':'Resend','Retry notification':'Retry'};
